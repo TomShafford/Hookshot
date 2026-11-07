@@ -186,6 +186,7 @@ bool replay_start();                          // vk_replay.cpp
 bool precompile_wanted();                     // vk_draw.cpp
 void precompile_run(void (*progress)(size_t done, size_t total));
 void prepare_run(void (*progress)(size_t done, size_t total));
+void all_shaders_run(void (*progress)(size_t done, size_t total));   // (tameem) vk_draw.cpp: every shader before the game
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 
 } // namespace mkwvk

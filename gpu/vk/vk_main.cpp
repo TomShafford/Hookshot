@@ -390,6 +390,7 @@ bool started_up() {
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
         prepare_run(progress);
+        all_shaders_run(progress);   // (tameem: before the precompile, which takes the programs it builds out of the cache)
         precompile_run(progress);
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
     }

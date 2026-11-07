@@ -30,6 +30,7 @@
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
+#include <psapi.h>   // (tameem: the all-shaders step reports the memory it takes; after vk_loader.h's windows.h, NOMINMAX)
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -422,14 +423,18 @@ std::atomic<int64_t> st_pipeline_us;
 // optimised as before, so what was met once runs optimised from the start the next time. RX_VK_FAST_FIRST=0: off
 thread_local bool tl_fast_build = false;
 std::atomic<int64_t> st_fast_n, st_fast_us, st_opt_n, st_opt_us;
-bool fast_first_wanted() {
+bool fast_first_wanted() {   // (off by default: on the RX 9070 XT a quick build took as long as an optimised one, ~140 ms. RX_VK_FAST_FIRST=1: on)
     static const bool on = [] {
         if (getenv("RX_VK_NOOPT")) return false;   // (everything unoptimised already)
         const char* e = getenv("RX_VK_FAST_FIRST");
-        return !e || atoi(e) != 0;
+        return e && atoi(e) != 0;
     }();
     return on;
 }
+// (tameem) the all-shaders step (all_shaders_run, below): the cache its libraries are built through, on its own threads only
+thread_local VkPipelineCache tl_lib_cache = VK_NULL_HANDLE;
+std::atomic<bool> all_shaders_done{false};
+std::atomic<int64_t> st_link_n, st_link_total_us, st_bg_full_n, st_bg_full_us;
 void fast_first_report() {   // (every 64 quick builds: how the two compare)
     static std::atomic<int64_t> last{0};
     const int64_t n = st_fast_n.load();
@@ -602,6 +607,28 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
     return pl;
 }
 
+// (tameem) A draw's program has both its shader libraries kept from the all-shaders step: its pipeline is a link away
+bool all_shaders_linkable(const Program& p, const Targets& at) {
+    if (!all_shaders_done.load(std::memory_order_acquire)) return false;
+    const uint64_t program = mix(p.key, p.variant);
+    std::lock_guard lk(gpl_mu);
+    return gpl_libs.count(mix(program, 1)) && gpl_libs.count(mix(mix(program, (uint64_t)at.samples), 2));
+}
+bool all_shaders_full_wanted() {   // (the optimised whole pipeline after the linked one. RX_VK_ALL_SHADERS_FULL=0: linked only)
+    static const bool on = !getenv("RX_VK_ALL_SHADERS_FULL") || atoi(getenv("RX_VK_ALL_SHADERS_FULL")) != 0;
+    return on;
+}
+void shader_report() {   // (every 64 new pipelines met in play: how they were made)
+    static std::atomic<int64_t> last{0};
+    const int64_t n = st_link_n.load() + st_fast_n.load();
+    if (n < last.load() + 64) return;
+    last = n;
+    const int64_t l = st_link_n.load(), b = st_bg_full_n.load();
+    logf("vk: pipelines met in play: %lld linked from kept shaders (%.2f ms each), %lld optimised in the background (%.1f ms each), %d "
+         "still to optimise", (long long)l, l ? st_link_total_us.load() / 1000.0 / (double)l : 0.0, (long long)b,
+         b ? st_bg_full_us.load() / 1000.0 / (double)b : 0.0, jobs_background_pending());
+}
+
 /// The pipeline entry of a draw (a new one is queued for a worker; RX_VK_SYNC_PIPELINES=1 builds it here)
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
     // the key: what is baked into it (the rest is dynamic state)
@@ -639,6 +666,45 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     pcache_init();
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
     pipeline_note(key, p, s, at, topo);
+    // (tameem) Every shader of the game was compiled before it started (all_shaders_run): a new pipeline is linked from its program's
+    // two kept libraries on a worker, at the front of the queue (no shader is compiled for it, only the vertex layout and the targets
+    // are added), and the draw goes ahead a frame or so later; the optimised whole pipeline follows from the background lane and takes
+    // its place (the linked one is left alone: draws recorded with it may still be on their way)
+    if (all_shaders_linkable(p, at) && !getenv("RX_VK_SYNC_PIPELINES")) {
+        struct LinkJob {
+            PipeEntry* e;
+            const Program* p;
+            NvnState s;
+            Targets at;
+            VkPrimitiveTopology topo;
+        };
+        auto job = std::make_shared<LinkJob>();
+        job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo;
+        jobs_push([job] {
+            const auto t0 = std::chrono::steady_clock::now();
+            const VkPipeline linked = gpl_link(*job->p, job->s, job->at, job->topo);
+            st_link_total_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            st_link_n++;
+            if (linked) {
+                job->e->pipeline = linked;
+                job->e->ready.store(true, std::memory_order_release);
+                if (all_shaders_full_wanted())
+                    jobs_push_background([job] {
+                        const auto t1 = std::chrono::steady_clock::now();
+                        if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
+                        st_bg_full_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t1).count();
+                        st_bg_full_n++;
+                    });
+            } else {   // (the link failed: built whole, as before)
+                static std::atomic<int> told{0};
+                if (told++ < 10) logf("vk: link of %016llx failed: built whole", (unsigned long long)job->p->key);
+                if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
+                job->e->ready.store(true, std::memory_order_release);
+            }
+            shader_report();
+        }, true);
+        return e;
+    }
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
         e->pipeline = build_graphics(p, s, at, topo);
@@ -872,7 +938,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         if (noopt || (tl_fast_build && part < 0)) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
     // (tameem: a quick build stays out of the saved cache: the optimised build after it is the one worth keeping)
-    const VkResult r = guarded_graphics(part >= 0 || tl_fast_build ? VK_NULL_HANDLE : pcache, &ci, &pl);
+    const VkResult r = guarded_graphics(part >= 0 ? tl_lib_cache : tl_fast_build ? VK_NULL_HANDLE : pcache, &ci, &pl);
     if (part >= 0) {
         if (r != VK_SUCCESS) {
             static std::atomic<int> logged;
@@ -3797,6 +3863,131 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     for (std::thread& t : threads) t.join();
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, notes.size(), computes.size(),
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// ---- (tameem) Every shader of the game before it starts. prepare_run translates each of the game's programs (all of its shader
+// archives) to SPIR-V once; what the driver then made of them during play was the stutter: ~140 ms a pipeline on the RX 9070 XT, 1,600
+// of them in a first session, each when an area first showed it. A pipeline is a program and what the draw adds (vertex layout, target
+// formats); with VK_EXT_graphics_pipeline_library the program's part is two libraries of their own (pre-rasterization: vertex or task and
+// mesh shaders; fragment shader) that do not depend on the draw. Here both are built for every kept program, before the game, and kept:
+// a draw then only links them with its vertex layout and targets (graphics_pipeline). The libraries go through a cache of their own,
+// hookshot_shader_libraries.bin, so the long build is the first start's only. Needs the blend, polygon, depth clamp and alpha-to-coverage
+// state dynamic (VK_EXT_extended_dynamic_state3), or those would be in the libraries too. A start that dies in here skips it the next
+// time (hookshot_all_shaders.running). RX_VK_ALL_SHADERS=0: off; RX_VK_ALL_SHADERS_MAX_MB=<n>: libraries kept up to n MB more memory
+// than before the step (6000), only cached after that ----
+void all_shaders_run(void (*progress)(size_t done, size_t total)) {
+    if (const char* e = getenv("RX_VK_ALL_SHADERS"); e && atoi(e) == 0) {
+        logf("vk: all shaders: off (RX_VK_ALL_SHADERS=0)");
+        return;
+    }
+    if (!(dev.graphics_pipeline_library && dev.eds3_blend && dev.eds3_polygon && dev.eds3_clamp && dev.eds3_a2c)) {
+        logf("vk: all shaders: not on this driver (pipeline libraries %d, dynamic blend %d, polygon mode %d, depth clamp %d, "
+             "alpha to coverage %d)", (int)dev.graphics_pipeline_library, (int)dev.eds3_blend, (int)dev.eds3_polygon, (int)dev.eds3_clamp,
+             (int)dev.eds3_a2c);
+        return;
+    }
+    char exe[MAX_PATH];
+    const DWORD exe_n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string dir(exe, exe_n);
+    dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+    const std::string running = dir + "hookshot_all_shaders.running", lib_path = dir + "hookshot_shader_libraries.bin";
+    if (FILE* f = fopen(running.c_str(), "rb")) {
+        fclose(f);
+        remove(running.c_str());
+        logf("vk: all shaders: the last start did not get through this step: left out this time");
+        return;
+    }
+    if (FILE* f = fopen(running.c_str(), "wb")) fclose(f);
+    VkPipelineCache libcache = VK_NULL_HANDLE;
+    size_t cache_kb = 0;
+    {
+        std::vector<uint8_t> data;
+        if (FILE* f = fopen(lib_path.c_str(), "rb")) {
+            _fseeki64(f, 0, SEEK_END);
+            const int64_t sz = _ftelli64(f);
+            _fseeki64(f, 0, SEEK_SET);
+            if (sz > 32) {
+                data.resize((size_t)sz);
+                if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+            }
+            fclose(f);
+        }
+        if (data.size() >= 32) {   // (another device's or driver's: dropped before Vulkan sees it, as pcache_init does)
+            uint32_t vendor, device;
+            std::memcpy(&vendor, data.data() + 8, 4);
+            std::memcpy(&device, data.data() + 12, 4);
+            if (vendor != dev.props.vendorID || device != dev.props.deviceID ||
+                std::memcmp(data.data() + 16, dev.props.pipelineCacheUUID, VK_UUID_SIZE))
+                data.clear();
+        }
+        cache_kb = data.size() >> 10;
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = data.size();
+        ci.pInitialData = data.empty() ? nullptr : data.data();
+        if (vkCreatePipelineCache(dev.device, &ci, nullptr, &libcache) != VK_SUCCESS) {
+            ci.initialDataSize = 0, ci.pInitialData = nullptr;
+            vkCreatePipelineCache(dev.device, &ci, nullptr, &libcache);
+        }
+    }
+    const auto private_mb = [] {
+        PROCESS_MEMORY_COUNTERS_EX pm{};
+        pm.cb = sizeof pm;
+        return K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm) ? (int64_t)(pm.PrivateUsage >> 20) : 0;
+    };
+    const int64_t mem0 = private_mb();
+    const int64_t cap_mb = getenv("RX_VK_ALL_SHADERS_MAX_MB") ? atoll(getenv("RX_VK_ALL_SHADERS_MAX_MB")) : 6000;
+    std::atomic<bool> keep{true};
+    std::atomic<int64_t> kept{0}, compiled{0}, failed{0};
+    std::atomic<size_t> seen{0};
+    logf("vk: all shaders: building every program's shader libraries (cache %zu KB)", cache_kb);
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t programs = program_cache_each_graphics([&](Program& p) {
+        static thread_local std::unique_ptr<NvnState> blank;
+        if (!blank) blank = std::make_unique<NvnState>(), blank->nvattr = 16;
+        if ((++seen & 255) == 0 && keep.load() && private_mb() - mem0 > cap_mb) {
+            keep = false;
+            logf("vk: all shaders: %lld MB more memory than before: the rest are cached, not kept", (long long)cap_mb);
+        }
+        tl_lib_cache = libcache;
+        ensure_layout(p);   // (the layout stays: the libraries were made with it)
+        const Targets at{};
+        const uint64_t program = mix(p.key, p.variant);
+        for (int part = 1; part <= 2; part++) {
+            const auto t1 = std::chrono::steady_clock::now();
+            VkPipeline lib = VK_NULL_HANDLE;
+            if (keep.load()) {
+                lib = gpl_part(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part, part == 1 ? program : mix(program, (uint64_t)at.samples));
+                if (lib) kept++;
+            } else if ((lib = build_graphics(p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part))) {
+                vkDestroyPipeline(dev.device, lib, nullptr);
+            }
+            if (!lib) failed++;
+            else if (std::chrono::steady_clock::now() - t1 > std::chrono::milliseconds(20)) compiled++;   // (not in the cache)
+        }
+        tl_lib_cache = VK_NULL_HANDLE;
+    }, std::max(1u, std::thread::hardware_concurrency()), progress);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (compiled.load() > 0) {   // (what was built now, kept for the next start)
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev.device, libcache, &n, nullptr) == VK_SUCCESS && n) {
+            std::vector<uint8_t> data(n);
+            if (vkGetPipelineCacheData(dev.device, libcache, &n, data.data()) == VK_SUCCESS) {
+                const std::string tmp = lib_path + ".tmp";
+                if (FILE* f = fopen(tmp.c_str(), "wb")) {
+                    const bool ok = fwrite(data.data(), 1, n, f) == n;
+                    fclose(f);
+                    if (ok) MoveFileExA(tmp.c_str(), lib_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+                }
+                cache_kb = n >> 10;
+            }
+        }
+    }
+    vkDestroyPipelineCache(dev.device, libcache, nullptr);   // (the kept libraries do not need it)
+    remove(running.c_str());
+    all_shaders_done.store(kept.load() > 0, std::memory_order_release);
+    logf("vk: all shaders: %zu programs, %lld libraries kept (%lld compiled now, the rest from the cache; %lld failed) in %.1f s; "
+         "cache %zu KB; memory %lld -> %lld MB", programs, (long long)kept.load(), (long long)compiled.load(), (long long)failed.load(),
+         secs, cache_kb, (long long)mem0, (long long)private_mb());
 }
 
 // (tameem) Optimised compute pipelines built in the background for programs that run a quick one: handed over at the program's

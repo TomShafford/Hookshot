@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>   // (tameem: program_cache_each_graphics)
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -914,6 +915,40 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
+/// (tameem) A kept program's record read into a Program, as program_cache_load does: null when a stage's module was not made
+std::unique_ptr<Program> program_from_record(uint64_t key, const std::vector<uint8_t>& data) {
+    Reader r{data.data()};
+    auto p = std::make_unique<Program>();
+    p->key = key;
+    const uint32_t kind = r.get<uint32_t>();
+    p->compute = (kind & 1) != 0, p->mesh = (kind & 2) != 0;
+    r.list(p->answers);
+    p->variant = answers_hash(*p);
+    p->workgroup = r.get<std::array<uint32_t, 3>>();
+    p->shared_memory = r.get<uint32_t>();
+    const uint64_t n = r.get<uint64_t>();
+    bool ok = true;
+    for (uint64_t k = 0; k < n; k++) {
+        p->stages.emplace_back();
+        Stage& st = p->stages.back();
+        st.nvn_stage = r.get<int>();
+        st.vk_stage = r.get<VkShaderStageFlagBits>();
+        std::vector<uint32_t> spirv;
+        r.list(spirv);
+        r.list(st.c1);
+        get_info(r, st.info);
+        st.module = make_module(spirv);
+        ok = ok && st.module;
+    }
+    if (!ok) {
+        for (Stage& st : p->stages)
+            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+        return nullptr;
+    }
+    p->ready.store(true, std::memory_order_release);
+    return p;
+}
+
 void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants) {
     disk_init();
     if (!disk_on) return;
@@ -932,34 +967,60 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             _fseeki64(disk_in, d.at, SEEK_SET);
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
-        Reader r{data.data()};
-        auto p = std::make_unique<Program>();
-        p->key = key;
-        const uint32_t kind = r.get<uint32_t>();
-        p->compute = (kind & 1) != 0, p->mesh = (kind & 2) != 0;
-        r.list(p->answers);
-        p->variant = answers_hash(*p);
-        p->workgroup = r.get<std::array<uint32_t, 3>>();
-        p->shared_memory = r.get<uint32_t>();
-        const uint64_t n = r.get<uint64_t>();
-        bool ok = true;
-        for (uint64_t k = 0; k < n; k++) {
-            p->stages.emplace_back();
-            Stage& st = p->stages.back();
-            st.nvn_stage = r.get<int>();
-            st.vk_stage = r.get<VkShaderStageFlagBits>();
-            std::vector<uint32_t> spirv;
-            r.list(spirv);
-            r.list(st.c1);
-            get_info(r, st.info);
-            st.module = make_module(spirv);
-            ok = ok && st.module;
-        }
-        if (!ok) continue;
-        p->ready.store(true, std::memory_order_release);
+        auto p = program_from_record(key, data);
+        if (!p) continue;
         variants.push_back(std::move(p));
         st_cache_hits++;
     }
+}
+
+
+/// (tameem) Every kept graphics program, read from hookshot_programs.bin one at a time on `threads` threads and given to fn, then let go
+/// (its shader modules destroyed; what fn made from it stays). The cache is left as it is: a draw still reads its program back as before
+size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsigned threads, void (*progress)(size_t done, size_t total)) {
+    disk_init();
+    if (!disk_on) return 0;
+    std::vector<std::pair<uint64_t, DiskRecord>> recs;
+    {
+        std::lock_guard lk(disk_mu);
+        for (const auto& kv : disk_records)
+            for (const DiskRecord& d : kv.second)
+                if (!(d.kind & 1)) recs.push_back({kv.first, d});
+    }
+    // (in file order: the reads go through the file once, front to back)
+    std::sort(recs.begin(), recs.end(), [](const auto& a, const auto& b) { return a.second.at < b.second.at; });
+    std::atomic<size_t> next{0}, done{0};
+    const auto worker = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        std::vector<uint8_t> data;
+        for (;;) {
+            const size_t i = next++;
+            if (i >= recs.size()) return;
+            data.resize(recs[i].second.size);
+            bool read;
+            {
+                std::lock_guard lk(disk_mu);
+                _fseeki64(disk_in, recs[i].second.at, SEEK_SET);
+                read = fread(data.data(), 1, data.size(), disk_in) == data.size();
+            }
+            if (read)
+                if (std::unique_ptr<Program> p = program_from_record(recs[i].first, data)) {
+                    fn(*p);
+                    for (Stage& st : p->stages)
+                        if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
+                }
+            done++;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < std::max(1u, threads); t++) pool.emplace_back(worker);
+    while (done.load() < recs.size()) {
+        if (progress) progress(done.load(), recs.size());
+        Sleep(100);
+    }
+    for (std::thread& t : pool) t.join();
+    if (progress) progress(recs.size(), recs.size());
+    return recs.size();
 }
 
 void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* fsc, const Code* csc,
