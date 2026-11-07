@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "vk_menu.h"
+#ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
+#define HOOKSHOT_VERSION "unknown"
+#endif
 
 namespace mkwvk {
 HWND app_window();
@@ -26,12 +29,13 @@ struct Row {
     const char* help;   // (shown under the list while the row is selected)
 };
 const char* tx_framegen(int v) {
-    static const char* t[] = {"Off", "", "2x", "3x", "4x"};
+    static const char* t[] = {"Off", "", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_upscale(int v) {
     static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
     return t[v];
 }
 const char* tx_percent(int v) {
@@ -50,8 +54,8 @@ const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9
 Row rows[] = {
     {"Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "Fills the whole screen with the game, without the window's border. The same as F11."},
-    {"Frame generation", &opts.framegen, 0, 4, 1, tx_framegen,
-     "Makes extra frames between the game's own, for smoother motion. Adds a little input delay, and fast motion or camera cuts "
+    {"Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
+     "Makes extra frames between the game's own (2x up to 8x), for smoother motion. Adds a little input delay, and fast motion or camera cuts "
      "can show artifacts."},
     {"Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
@@ -94,6 +98,7 @@ const char* ini_key(const Row& r) {
 void save() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         for (const Row& r : rows) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
+        fprintf(f, "options_version=2\n");   // (game_speed below 2 was only ever the old default, see menu_init)
         fclose(f);
     }
 }
@@ -202,6 +207,25 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HGDIOBJ old = SelectObject(dc, title);
     SetTextColor(dc, RGB(236, 240, 236));
     TextOutA(dc, 16 * s, 12 * s, "Hookshot", 8);
+    {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
+        // line would run into the title)
+        SIZE tsz{};
+        GetTextExtentPoint32A(dc, "Hookshot", 8, &tsz);
+        HFONT small = font(12 * s, FW_NORMAL);
+        SelectObject(dc, small);
+        SetTextColor(dc, RGB(140, 150, 144));
+        std::string ver = HOOKSHOT_VERSION;
+        const int room = (int)w - 32 * s - tsz.cx - 12 * s;
+        SIZE sz{};
+        GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
+        if (sz.cx > room && ver.find(" (") != std::string::npos) {
+            ver.resize(ver.find(" ("));
+            GetTextExtentPoint32A(dc, ver.c_str(), (int)ver.size(), &sz);
+        }
+        if (sz.cx <= room) TextOutA(dc, (int)w - 16 * s - sz.cx, 18 * s, ver.c_str(), (int)ver.size());
+        SelectObject(dc, title);
+        DeleteObject(small);
+    }
     SelectObject(dc, body);
     const int rh = 28 * s, top = 44 * s;
     for (int i = 0; i < kRows; i++) {
@@ -327,6 +351,7 @@ void menu_init() {
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         char line[80];
         bool has_resolution = false;
+        bool v2 = false;
         int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
         while (fgets(line, sizeof line, f)) {
             char* eq = strchr(line, '=');
@@ -335,15 +360,21 @@ void menu_init() {
             for (Row& r : rows)
                 if (!strcmp(line, ini_key(r))) *r.value = std::min(std::max(atoi(eq + 1), r.lo), r.hi);
             has_resolution |= !strcmp(line, "resolution");
+            v2 |= !strcmp(line, "options_version");
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
         }
         fclose(f);
         if (!has_resolution && old_dynres >= 0) opts.resolution = old_dynres ? 0 : 1;
+        // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
+        // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
+        if (!v2) opts.realtime = 1;
     }
     if (opts.framegen == 1) opts.framegen = 2;
-    if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 4);
+    if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 8);
     if (const char* e = getenv("RX_VK_PACE")) opts.pace = atoi(e) != 0;
-    if (const char* e = getenv("RX_VK_UPSCALE")) opts.upscale = atoi(e);
+    if (const char* e = getenv("RX_VK_UPSCALE"))
+        for (Row& r : rows)
+            if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
 }
@@ -377,6 +408,23 @@ void fullscreen_tick() {
     }
 }
 
+/// A rate over the half-second that just ended. The first call only starts that interval: the frames since launch,
+/// divided by one second, were shown as the rate the moment the counter was turned on.
+bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* last_shown, int64_t* last_game,
+              double* shown_rate, double* game_rate) {
+    if (now < *next) return false;
+    const bool have = *next != 0;
+    if (have) {
+        const double secs = (now - *next + 500000000) / 1e9;
+        *shown_rate = (shown - *last_shown) / secs;
+        *game_rate = (game - *last_game) / secs;
+    }
+    *last_shown = shown;
+    *last_game = game;
+    *next = now + 500000000;
+    return have;
+}
+
 void menu_tick() {
     fullscreen_tick();
     static bool held[7];
@@ -403,7 +451,7 @@ void menu_tick() {
         if (press[3] || press[4]) {
             Row& r = rows[selected];
             int v = *r.value + (press[4] ? r.step : -r.step);
-            if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x, 3x, 4x)
+            if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
             *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
             changed = true;
             save();
@@ -413,15 +461,11 @@ void menu_tick() {
     if (opts.show_fps) {
         static int64_t next = 0, last_game = 0, last_shown = 0;
         const int64_t now = prof_now();
-        if (now >= next) {
-            const double secs = next ? (now - next + 500000000) / 1e9 : 1.0;
-            const int64_t g = game_frames.load(), sh = shown_frames.load();
-            const double shown = (sh - last_shown) / secs, game = (g - last_game) / secs;
+        double shown = 0, game = 0;
+        if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
             snprintf(fps_text, sizeof fps_text, "%.0f", shown);
             if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
             else fps_sub[0] = 0;
-            last_game = g, last_shown = sh;
-            next = now + 500000000;
             fps_bmp.keyed = true;
             gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);
         }
@@ -430,6 +474,15 @@ void menu_tick() {
 
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h) {
     if (opts.show_fps) {
+        // The game image was just blitted (or cleared) into dst. Its write must
+        // finish before the FPS pixels overwrite it; command order alone does
+        // not order these transfer writes. The menu below has its own barrier.
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
         std::unique_lock lk(bmp_mu);
         const uint32_t fw = fps_bmp.w;
         lk.unlock();
