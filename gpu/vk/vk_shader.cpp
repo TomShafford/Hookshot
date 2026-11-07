@@ -975,6 +975,8 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
 }
 
 
+} // namespace   (tameem: program_cache_each_graphics is called from vk_draw.cpp)
+
 /// (tameem) Every kept graphics program, read from hookshot_programs.bin one at a time on `threads` threads and given to fn, then let go
 /// (its shader modules destroyed; what fn made from it stays). The cache is left as it is: a draw still reads its program back as before
 size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsigned threads, void (*progress)(size_t done, size_t total)) {
@@ -1022,6 +1024,8 @@ size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsi
     if (progress) progress(recs.size(), recs.size());
     return recs.size();
 }
+
+namespace {
 
 void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* fsc, const Code* csc,
                     const uint8_t color_types[8]) {
