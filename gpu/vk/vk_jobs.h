@@ -10,6 +10,10 @@ namespace mkwvk {
 
 /// Queues fn for a worker (urgent: ahead of the others, for work a draw waits on)
 void jobs_push(std::function<void()> fn, bool urgent = false);
+/// (tameem) Queues fn behind everything: a worker takes it only when no other job waits (the optimised builds that replace
+/// the quick ones, vk_draw.cpp). Not counted by jobs_pending
+void jobs_push_background(std::function<void()> fn);
+int jobs_background_pending();
 /// Waits until flag is set by a job (which calls jobs_notify after setting it)
 void jobs_wait(const std::atomic<bool>& flag);
 void jobs_notify();

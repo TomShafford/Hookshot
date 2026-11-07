@@ -416,6 +416,30 @@ void skip_report_impl(double frames) {
 }
 std::atomic<int64_t> st_pipelines, st_links, st_link_us;
 std::atomic<int64_t> st_pipeline_us;
+// (tameem) Quick first, optimised after. A pipeline first met during play is built without the driver's optimizer (AMD's
+// compiler took ~140 ms a pipeline optimised, 225 s in a 15-minute session, and the game waited or left draws out meanwhile);
+// the optimised build follows on a background worker and takes its place. Those before the game (the precompile) are built
+// optimised as before, so what was met once runs optimised from the start the next time. RX_VK_FAST_FIRST=0: off
+thread_local bool tl_fast_build = false;
+std::atomic<int64_t> st_fast_n, st_fast_us, st_opt_n, st_opt_us;
+bool fast_first_wanted() {
+    static const bool on = [] {
+        if (getenv("RX_VK_NOOPT")) return false;   // (everything unoptimised already)
+        const char* e = getenv("RX_VK_FAST_FIRST");
+        return !e || atoi(e) != 0;
+    }();
+    return on;
+}
+void fast_first_report() {   // (every 64 quick builds: how the two compare)
+    static std::atomic<int64_t> last{0};
+    const int64_t n = st_fast_n.load();
+    if (n < last.load() + 64) return;
+    last = n;
+    const int64_t o = st_opt_n.load();
+    logf("vk: quick pipelines %lld (%.1f ms each), optimised over them %lld (%.1f ms each), %d still to optimise", (long long)n,
+         n ? st_fast_us.load() / 1000.0 / (double)n : 0.0, (long long)o, o ? st_opt_us.load() / 1000.0 / (double)o : 0.0,
+         jobs_background_pending());
+}
 double st_wait_ms;
 
 bool depth_aspect(VkFormat f) {
@@ -642,6 +666,30 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     auto job = std::make_shared<Job>();
     job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo;
     jobs_push([job] {
+        // (tameem) the quick build first, when nothing linked stands in already: the draw goes ahead with it, and the optimised
+        // build replaces it from the background lane. The quick one is left alone, as a linked one is: draws recorded with it
+        // may still be on their way
+        if (fast_first_wanted() && !job->e->ready.load(std::memory_order_acquire)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            tl_fast_build = true;
+            const VkPipeline quick = build_graphics(*job->p, job->s, job->at, job->topo);
+            tl_fast_build = false;
+            st_fast_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            st_fast_n++;
+            if (quick) {
+                job->e->pipeline = quick;
+                job->e->ready.store(true, std::memory_order_release);
+                jobs_push_background([job] {
+                    const auto t1 = std::chrono::steady_clock::now();
+                    if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
+                    st_opt_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t1).count();
+                    st_opt_n++;
+                });
+                fast_first_report();
+                return;
+            }
+            // (the quick build failed: the optimised one, now, as before)
+        }
         // (over a linked one, which is left alone: draws recorded with it may still be on their way)
         if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
         job->e->ready.store(true, std::memory_order_release);
@@ -819,10 +867,12 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     VkPipeline pl = VK_NULL_HANDLE;
     {   // (local) RX_VK_NOOPT=1: build every pipeline without the driver's optimizer. AMD's proprietary compiler crashes
         // (-13 here) or takes minutes on some Ocarina shaders it builds in seconds unoptimized (Lichii #200, #210).
+        // (tameem) and the quick first build of a pipeline met during play (tl_fast_build, graphics_pipeline below)
         static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
-        if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        if (noopt || (tl_fast_build && part < 0)) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
-    const VkResult r = guarded_graphics(part >= 0 ? VK_NULL_HANDLE : pcache, &ci, &pl);
+    // (tameem: a quick build stays out of the saved cache: the optimised build after it is the one worth keeping)
+    const VkResult r = guarded_graphics(part >= 0 || tl_fast_build ? VK_NULL_HANDLE : pcache, &ci, &pl);
     if (part >= 0) {
         if (r != VK_SUCCESS) {
             static std::atomic<int> logged;
@@ -3749,6 +3799,43 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
+// (tameem) Optimised compute pipelines built in the background for programs that run a quick one: handed over at the program's
+// next dispatch, on the thread that records it (the quick one is left alone: dispatches recorded with it may be on their way)
+std::mutex compute_upgrade_mu;
+std::unordered_map<Program*, VkPipeline> compute_upgrades;
+std::atomic<int> compute_upgrades_waiting{0};
+void compute_take_upgrade(Program& p) {
+    ParLock lk;
+    std::lock_guard g(compute_upgrade_mu);
+    const auto it = compute_upgrades.find(&p);
+    if (it == compute_upgrades.end()) return;
+    p.compute_pipeline = it->second;
+    compute_upgrades.erase(it);
+    compute_upgrades_waiting--;
+}
+void compute_queue_upgrade(Program& p) {
+    Program* const pp = &p;
+    jobs_push_background([pp] {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = pp->stages[0].module;
+        ci.stage.pName = "main";
+        pin_subgroup(ci.stage, pp->workgroup[0]);
+        ci.layout = pp->layout;
+        VkPipeline full = VK_NULL_HANDLE;
+        const auto t0 = std::chrono::steady_clock::now();
+        const VkResult made = guarded_compute(pcache, &ci, &full);
+        st_opt_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        st_opt_n++;
+        if (made != VK_SUCCESS || !full) return;   // (the quick one stays)
+        pcache_built_since_save++;
+        std::lock_guard g(compute_upgrade_mu);
+        if (compute_upgrades.emplace(pp, full).second) compute_upgrades_waiting++;
+        else vkDestroyPipeline(dev.device, full, nullptr);
+    });
+}
+
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     PROF(PROF_DISPATCH);
     DispatchClock dclock;
@@ -3840,6 +3927,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
     }
     Program& p = const_cast<Program&>(*cp);
+    if (compute_upgrades_waiting.load(std::memory_order_acquire)) compute_take_upgrade(p);   // (tameem: the optimised one, when it is built)
     ParLock plk(!p.layout || !p.compute_pipeline);
     ensure_layout(p);
     if (!p.compute_pipeline && !taau_key(p.key)) {   // (a stood-in network is never compiled)
@@ -3855,8 +3943,21 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
             if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
+        // (tameem) quick first here too: a dispatch is never left out, so the game waited for its build (3 s for one of the
+        // networks on AMD). Unoptimised now, the optimised build from the background lane at a later dispatch
+        const bool quick = fast_first_wanted();
+        if (quick) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         const auto t0 = std::chrono::steady_clock::now();
-        if (const VkResult made = guarded_compute(pcache, &ci, &p.compute_pipeline); made != VK_SUCCESS) {
+        VkResult made = guarded_compute(quick ? VK_NULL_HANDLE : pcache, &ci, &p.compute_pipeline);
+        if (quick && made == VK_SUCCESS) {
+            st_fast_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            st_fast_n++;
+            compute_queue_upgrade(p);
+        } else if (quick) {   // (the quick build failed: the optimised one, now, as before)
+            ci.flags &= ~VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            made = guarded_compute(pcache, &ci, &p.compute_pipeline);
+        }
+        if (made != VK_SUCCESS) {
             static std::atomic<int> told{0};
             if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)p.key, (int)made);
             p.compute_pipeline = VK_NULL_HANDLE;
