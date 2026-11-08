@@ -25,6 +25,9 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
 /// (tameem) Records the copy of a level of a compressed (BC) image as its blocks, all its layers (they do not blit): written
 /// to the dump's folder as raw_<what>_#<id>_<gpu>_f<format>_<w>x<h>x<layers>_l<level>.bin, decoded off line
 void dump_image_raw(VkCommandBuffer cmd, Texture* tex, uint32_t level, const char* what);
+/// (tameem) Records the copy of [off, off + n) of a buffer (at most 1 MB; outside a pass), written whole to the dump's folder as
+/// <name> (the GPU's copy of a uniform buffer, beside the game memory's: RX_VK_DUMP_UBO)
+void dump_buffer_file(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSize n, const char* name);
 /// Copies were recorded into the submission being made (it has to complete before dump_write)
 bool dump_pending();
 /// Writes and frees the copies (their submission completed)

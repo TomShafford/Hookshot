@@ -155,6 +155,7 @@ void flush_mapped(VmaAllocation allocation, uint64_t size);
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
 /// (vk_replay.cpp) guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
+bool ub_overlaps(uint64_t addr, uint64_t n);   // (tameem) an inline update reaches into the range (vk_replay.cpp)
 /// [guest, guest + n) as of the submit being replayed: live itself, or scratch holding it with the kept pages over it
 const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t n, std::vector<uint8_t>& scratch);
 void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the capture did not take: the copies go)

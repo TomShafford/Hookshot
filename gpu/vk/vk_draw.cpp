@@ -203,6 +203,8 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
 /// what can be read), to <RX_VK_DUMP_DIR>/ub_<frame>_<key>_s<stage>_c<n>.bin; the log's dump-ub line says where the binding
 /// is, the game's size for it, what the shader reads and the range its descriptor gets (the tall grass tops: their per-layer
 /// and per-instance tables)
+struct DumpUbGpu { uint64_t addr, n; std::string name; };
+thread_local std::vector<DumpUbGpu> dump_ub_gpu;   // (copied from the GPU's copy at the pass's end, outside it)
 void dump_uniforms(const NvnState& s, const Program& p) {
     static const char* list = getenv("RX_VK_DUMP_UBO");
     if (!list || !*list) return;
@@ -239,9 +241,15 @@ void dump_uniforms(const NvnState& s, const Program& p) {
             bool wrote = false;
             if (n >= 256)
                 if (FILE* fp = fopen(path, "wb")) wrote = fwrite(b.data(), 1, n, fp) == n, fclose(fp);
-            logf("vk: dump-ub prog %s s%d c%u at %#llx size %#llx used %#x range %#llx: %#llx bytes %s %s", hex, ns, i,
+            const bool overlay = ub_overlaps(u.addr, range);
+            logf("vk: dump-ub prog %s s%d c%u at %#llx size %#llx used %#x range %#llx (%s): %#llx bytes %s %s", hex, ns, i,
                  (unsigned long long)u.addr, (unsigned long long)u.size, used, (unsigned long long)range,
+                 overlay ? "bound as a copy of game memory with inline updates" : "bound as the GPU's copy",
                  (unsigned long long)(n >= 256 ? n : 0), wrote ? "written to" : "NOT written to", path);
+            // (and the GPU's own copy of the range, to compare with the game memory's: what the GPU wrote there itself)
+            char gname[160];
+            snprintf(gname, sizeof gname, "ubgpu_%llu_%s_s%d_c%u.bin", (unsigned long long)f, hex, ns, i);
+            if (dump_ub_gpu.size() < 256) dump_ub_gpu.push_back({u.addr, range, gname});
         }
     }
 }
@@ -3286,6 +3294,10 @@ void end_pass(VkCommandBuffer cmd) {
             }
         }
     dump_sampled.clear();
+    if (dump_on())   // (tameem: RX_VK_DUMP_UBO, the GPU's copies)
+        for (const DumpUbGpu& u : dump_ub_gpu)
+            if (const BufferRef b = gpu_buffer_bind(u.addr, u.n, false)) dump_buffer_file(cmd, b.buffer, b.offset, u.n, u.name.c_str());
+    dump_ub_gpu.clear();
     pass.prog = 0;
 }
 

@@ -334,6 +334,15 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
     return at;
 }
 
+/// (tameem) An inline uniform update before the stream's place reaches into [addr, addr + n): the binding is then a copy of
+/// guest memory with the updates over it (ub_overlay), not the GPU's own copy (RX_VK_DUMP_UBO tells which)
+bool ub_overlaps(uint64_t addr, uint64_t n) {
+    const size_t lim = std::min(ub_limit, ub_updates.size());
+    for (size_t i = 0; i < lim; i++)
+        if (ub_updates[i].dst < addr + n && addr < ub_updates[i].dst + ub_updates[i].bytes.size()) return true;
+    return false;
+}
+
 /// Guest memory as the stream's place sees it: as it was at the submission (the capture), with the uniform updates
 /// the stream made before this place (a worker: before its segment) over it. For what the replay reads on the CPU for
 /// the GPU's sake (handles in uniform and storage buffers): the game's memory now may be its next frames'.

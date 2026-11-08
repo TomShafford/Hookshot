@@ -432,6 +432,26 @@ void dump_image_raw(VkCommandBuffer cmd, Texture* tex, uint32_t level, const cha
     raw_items.push_back(std::move(it));
 }
 
+void dump_buffer_file(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSize n, const char* name) {
+    if (!armed || !src || !n || n > (1u << 20)) return;
+    RawItem it;
+    it.n = n;
+    it.name = name;
+    if (!create_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.alloc, &it.map) || !it.map) return;
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(cmd, &d);
+    const VkBufferCopy c{off, 0, n};
+    vkCmdCopyBuffer(cmd, src, it.buffer, 1, &c);
+    vkCmdPipelineBarrier2(cmd, &d);
+    raw_items.push_back(std::move(it));
+}
+
 namespace {
 struct BufItem {
     VkBuffer buffer = VK_NULL_HANDLE;
