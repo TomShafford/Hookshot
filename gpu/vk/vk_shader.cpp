@@ -924,9 +924,11 @@ constexpr uint32_t kKindVertexOffsets = 32;
 // (tameem) and 64: made by a translator with the marker fix (11-08, lower_to_maxwell.h): an extended register's marker is none of the
 // numbers its instruction's fields hold. Before it a destination in the lowering's scratch range could take the number of a high source
 // of the same instruction, and the two became one register (OoT's flower heads, wheat and lavender: a card corner's depth overwritten,
-// the colour pass clipped away, the G-buffer left as the sky). A program whose stages' lowering it changes (Code::marker_fix) and that
-// is kept only without 64 is translated again at its first draw; the rest keep theirs
+// the colour pass clipped away, the G-buffer left as the sky). A program whose stages' lowering it changes (Code::marker_fix) is
+// translated again at its first draw unless a record with 128 is kept (below); the rest keep theirs
 constexpr uint32_t kKindMarkerFix = 64;
+// (tameem) and 128: one of those, translated again for it (Program::marker_changed)
+constexpr uint32_t kKindMarkerChanged = 128;
 std::mutex retrans_mu;
 std::unordered_set<uint64_t> retrans_keys;
 std::string retrans_path;
@@ -1120,7 +1122,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix | (p.marker_changed ? kKindMarkerChanged : 0u)));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -1142,7 +1144,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing)
-        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix)});
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix | (p.marker_changed ? kKindMarkerChanged : 0u))});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1201,7 +1203,9 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         disk_records.erase(it);
     }
     for (const DiskRecord& d : recs) {
-        if (lowering_changed && !(d.kind & kKindMarkerFix)) {   // (tameem: made before the marker fix, which changes this program)
+        // (tameem: made before the marker fix, which changes this program, or by its first build, whose translation was right but whose
+        // pipelines took the older one's shader libraries: same key and variant. Kept are those with kind 128 only)
+        if (lowering_changed && !(d.kind & kKindMarkerChanged)) {
             static std::atomic<int> told{0};
             if (told++ < 60) logf("vk: program %016llx: its kept translation is from before the marker fix, which changes it: translated again",
                                   (unsigned long long)key);
@@ -1214,7 +1218,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         auto p = program_from_record(key, data);
-        if (p) p->marker_fixed = (d.kind & kKindMarkerFix) != 0;
+        if (p) p->marker_fixed = (d.kind & kKindMarkerFix) != 0, p->marker_changed = (d.kind & kKindMarkerChanged) != 0;
         if (p && (stale_mesh_record(d.kind) || stale_vertex_record(d.kind, key))) drop_stale(key, p);
         if (!p) continue;
         variants.push_back(std::move(p));
@@ -1268,6 +1272,8 @@ size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsi
             }
             if (read)
                 if (std::unique_ptr<Program> p = program_from_record(recs[i].first, data)) {
+                    p->marker_fixed = (recs[i].second.kind & kKindMarkerFix) != 0;   // (tameem: its libraries' keys, program_ident)
+                    p->marker_changed = (recs[i].second.kind & kKindMarkerChanged) != 0;
                     if (stale_mesh_record(recs[i].second.kind) || stale_vertex_record(recs[i].second.kind, recs[i].first)) {   // (translated again at its first draw: no pipeline for this one)
                         drop_stale(recs[i].first, p);
                         done++;
@@ -1649,7 +1655,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     const bool lowering_changed = mesh->marker_fix || (task && task->marker_fix) || (fsc && fsc->marker_fix);   // (tameem, kKindMarkerFix)
     program_cache_load(key, variants, lowering_changed);
     for (auto& p : variants) {
-        if (lowering_changed && !p->marker_fixed) continue;
+        if (lowering_changed && !p->marker_changed) continue;
         if (!p->ready.load(std::memory_order_acquire)) return p.get();
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
@@ -1658,6 +1664,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     auto p = std::make_unique<Program>();
     p->key = key;
     p->mesh = true;
+    p->marker_changed = lowering_changed;   // (tameem: its pipelines apart from an older translation's)
     Program* raw = p.get();
     variants.push_back(std::move(p));
     struct Job {
@@ -1811,7 +1818,7 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
                                   (stage_code[5] && stage_code[5]->marker_fix);
     program_cache_load(key, variants, lowering_changed);
     for (auto& p : variants) {
-        if (lowering_changed && !p->marker_fixed) continue;   // (one read back before this program's codes were met: left as it is)
+        if (lowering_changed && !p->marker_changed) continue;   // (one read back before this program's codes were met: left as it is)
         if (!p->ready.load(std::memory_order_acquire)) return p.get();   // (being translated)
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
@@ -1821,6 +1828,7 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     auto p = std::make_unique<Program>();
     p->key = key;
     p->compute = compute;
+    p->marker_changed = lowering_changed;   // (tameem: its pipelines apart from an older translation's)
     Program* raw = p.get();
     variants.push_back(std::move(p));
     static const bool sync = getenv("RX_VK_SYNC_SHADERS") != nullptr;

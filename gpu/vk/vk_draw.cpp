@@ -957,6 +957,12 @@ bool gpl_wanted() {
                            getenv("RX_VK_GPL") != nullptr;   // (off until the driver step is safe: linked cold, the libraries stall the draw)
     return on;
 }
+/// (tameem) A program's identity for its pipelines and shader libraries: its key and variant, and whether it was translated again for
+/// the marker fix (Program::marker_changed): the older translation's, built from a kept record with the same key and variant, stay its own
+uint64_t program_ident(const Program& p) {
+    const uint64_t id = mix(p.key, p.variant);
+    return p.marker_changed ? mix(id, 0x6d61726b65726669ull) : id;
+}
 std::mutex gpl_mu;
 std::unordered_map<uint64_t, VkPipeline> gpl_libs;
 VkPipeline gpl_part(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part, uint64_t key) {
@@ -973,7 +979,7 @@ VkPipeline gpl_part(const Program& p, const NvnState& s, const Targets& at, VkPr
     return it->second;
 }
 VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
-    const uint64_t program = mix(p.key, p.variant);
+    const uint64_t program = program_ident(p);
     uint64_t input = (uint64_t)topology_class(topo) + 1;
     if (!p.mesh) {
         const Shader::Info& vs = p.stages[0].info;
@@ -1007,7 +1013,7 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
 // (tameem) A draw's program has both its shader libraries kept from the all-shaders step: its pipeline is a link away
 bool all_shaders_linkable(const Program& p, const NvnState& s, const Targets& at) {
     if (!all_shaders_done.load(std::memory_order_acquire)) return false;
-    const uint64_t program = mix(p.key, p.variant);
+    const uint64_t program = program_ident(p);
     const bool dither = a2c_dithers(p, s, at);   // (tameem: its dithered fragment library is made at the link, on the worker)
     std::lock_guard lk(gpl_mu);
     return gpl_libs.count(mix(program, 1)) && (dither || gpl_libs.count(mix(mix(program, (uint64_t)at.samples), 2)));
@@ -1032,7 +1038,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
     // one ran another's shaders under its own descriptors)
-    uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topology_class(topo) << 8 | (uint64_t)at.samples);
+    uint64_t key = mix(program_ident(p), (uint64_t)topology_class(topo) << 8 | (uint64_t)at.samples);
     const Shader::Info& vs = p.stages[0].info;
     if (!p.mesh) {
         for (int i = 0; i < 16; i++)
@@ -5587,7 +5593,7 @@ void all_shaders_run(void (*progress)(size_t done, size_t total)) {
         tl_lib_cache = libcache;
         ensure_layout(p);   // (the layout stays: the libraries were made with it)
         const Targets at{};
-        const uint64_t program = mix(p.key, p.variant);
+        const uint64_t program = program_ident(p);
         for (int part = 1; part <= 2; part++) {
             const auto t1 = std::chrono::steady_clock::now();
             VkPipeline lib = VK_NULL_HANDLE;

@@ -39,6 +39,9 @@ struct Program {
     // lowering that fix changes is translated again when only an older one is held (vk_shader.cpp kKindMarkerFix). (In the padding
     // after ready: the record layout and the cache's ABI sizes stay as they were)
     bool marker_fixed = true;
+    // (tameem) and translated again for that fix (or read back from such a record, kind 128): its pipelines and shader libraries are
+    // kept apart from the older translation's, which have the same key and variant (vk_draw.cpp program_ident)
+    bool marker_changed = false;
     std::vector<Stage> stages;
     std::array<uint32_t, 3> workgroup{1, 1, 1};
     uint32_t shared_memory = 0;
