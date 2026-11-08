@@ -42,6 +42,7 @@
 #include "shaders/taau_upscale_comp_spv.h"
 #include "shaders/taa_blend_comp_spv.h"
 #include "shaders/taa_store_comp_spv.h"
+#include "vk_a2c_dither.h"
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
@@ -678,6 +679,96 @@ uint32_t target_write_mask(const Program& p, const NvnState& s, int i) {
 }
 thread_local const Program* cur_program = nullptr;   // (the draw's, for its dynamic write masks)
 
+/// (tameem) NVIDIA's alpha-to-coverage dither on AMD (vk_a2c_dither.h): the grass, wheat and leaves are drawn with alpha-to-
+/// coverage into single-sample targets, which the Switch 2 dithers over 2x2 pixels and AMD's driver turns into a cut at alpha 0.5
+/// (the blades' edges snapping on and off: the shimmer; the blades the game fades out gone: the black patches). Such a draw's
+/// pipeline gets its fragment shader with the dither in it, and alpha-to-coverage off. The fragment modules' code is kept from the
+/// precompile on (the game's programs, not the all-shaders step's), to make the dithered copy from. RX_VK_A2C_DITHER=0: as before
+namespace a2c {
+std::mutex mu;
+std::unordered_map<VkShaderModule, std::vector<uint32_t>> spirv;   // (fragment modules made since begin())
+std::unordered_map<VkShaderModule, VkShaderModule> patched;        // (original -> dithered copy; null: none could be made)
+uint64_t bytes = 0;
+PFN_vkCreateShaderModule real_create = nullptr;
+PFN_vkDestroyShaderModule real_destroy = nullptr;
+bool on() {
+    static const bool v = !getenv("RX_VK_A2C_DITHER") || atoi(getenv("RX_VK_A2C_DITHER")) != 0;
+    return v;
+}
+VKAPI_ATTR VkResult VKAPI_CALL create(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* al, VkShaderModule* m) {
+    const VkResult r = real_create(d, ci, al, m);
+    if (r == VK_SUCCESS && ci && ci->pCode && a2cd::is_fragment(ci->pCode, ci->codeSize / 4)) {
+        std::lock_guard lk(mu);
+        if (bytes + ci->codeSize <= (1024ull << 20)) {
+            spirv[*m].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+            bytes += ci->codeSize;
+        } else {
+            static bool told;
+            if (!told) told = true, logf("vk: alpha-to-coverage dither: 1 GB of fragment code kept: no more");
+        }
+    }
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL destroy(VkDevice d, VkShaderModule m, const VkAllocationCallbacks* al) {
+    VkShaderModule copy = VK_NULL_HANDLE;
+    {
+        std::lock_guard lk(mu);
+        if (auto it = spirv.find(m); it != spirv.end()) bytes -= it->second.size() * 4, spirv.erase(it);
+        if (auto it = patched.find(m); it != patched.end()) copy = it->second, patched.erase(it);
+    }
+    if (copy) real_destroy(d, copy, al);   // (the pipelines made with it keep what they need)
+    real_destroy(d, m, al);
+}
+void begin() {   // (once, before the precompile loads the game's programs)
+    static bool done = false;
+    if (done || !on() || !vkCreateShaderModule || !vkDestroyShaderModule) return;
+    done = true;
+    real_create = vkCreateShaderModule, real_destroy = vkDestroyShaderModule;
+    vkCreateShaderModule = create, vkDestroyShaderModule = destroy;
+    logf("vk: alpha-to-coverage dither: on (single-sample targets dithered over 2x2 pixels, as the Switch 2's GPU; RX_VK_A2C_DITHER=0: off)");
+}
+/// the dithered copy of a fragment module, made at its first want (null: its code was not kept, or not patched)
+VkShaderModule dithered(VkShaderModule m) {
+    std::lock_guard lk(mu);
+    if (auto it = patched.find(m); it != patched.end()) return it->second;
+    VkShaderModule made = VK_NULL_HANDLE;
+    std::string why = "its code was not kept (made before the precompile)";
+    if (auto it = spirv.find(m); it != spirv.end()) {
+        std::vector<uint32_t> out;
+        if (a2cd::patch(it->second.data(), it->second.size(), out, why)) {
+            VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            ci.codeSize = out.size() * 4, ci.pCode = out.data();
+            if (real_create(dev.device, &ci, nullptr, &made) != VK_SUCCESS) made = VK_NULL_HANDLE, why = "its module was not made";
+        }
+    }
+    patched[m] = made;
+    static int told = 0;
+    if (!made && told++ < 20) logf("vk: alpha-to-coverage dither: a fragment shader left as it was: %s", why.c_str());
+    return made;
+}
+}  // namespace a2c
+const Stage* fragment_stage(const Program& p) {
+    for (const Stage& st : p.stages)
+        if (st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) return &st;
+    return nullptr;
+}
+/// a draw whose pipeline has the dither in its fragment shader, and alpha-to-coverage off
+bool a2c_dithers(const Program& p, const NvnState& s, const Targets& at) {
+    if (!s.ms.a2c || at.samples != VK_SAMPLE_COUNT_1_BIT || no_a2c() || !a2c::on() || !a2c::real_create) return false;
+    const Stage* fs = fragment_stage(p);
+    const bool yes = fs && fs->module && a2c::dithered(fs->module);
+    {   // (each program once: what the game asked for and what it got)
+        static std::mutex lm;
+        static std::unordered_set<uint64_t> seen;
+        std::lock_guard lk(lm);
+        if (seen.size() < 400 && seen.insert(p.key).second)
+            logf("vk: alpha-to-coverage draw: program %016llx into %ux%u (the game's samples %u, raster samples %u, dither %u): %s",
+                 (unsigned long long)p.key, at.width, at.height, (unsigned)s.ms.samples, (unsigned)s.ms.raster_samples,
+                 (unsigned)s.ms.a2c_dither, yes ? "dithered in its shader" : "left to the GPU");
+    }
+    return yes;
+}
+
 // ---- (hookshot) The precompile, as TotK Recomp's (runtime/vk_pipeline.c vk_pipeline_prewarm, keys in pipeline-keys.bin): each
 // pipeline the game asks for is noted in hookshot_pipelines.bin, by what built it; a release build, before the game starts,
 // makes every kept program ready and builds every noted pipeline on all the CPUs (the driver's own cache, mkw_vk_pipelines.bin,
@@ -777,7 +868,8 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
     uint32_t n = 0;
     if (!p.mesh) libs[n++] = gpl_part(p, s, at, topo, 0, input);
     libs[n++] = gpl_part(p, s, at, topo, 1, program);
-    libs[n++] = gpl_part(p, s, at, topo, 2, mix(program, (uint64_t)at.samples));
+    libs[n++] = gpl_part(p, s, at, topo, 2, a2c_dithers(p, s, at) ? mix(mix(program, (uint64_t)at.samples), 0xa2cd17e1ull)
+                                                                  : mix(program, (uint64_t)at.samples));   // (tameem: dithered)
     libs[n++] = gpl_part(p, s, at, topo, 3, output);
     for (uint32_t i = 0; i < n; i++)
         if (!libs[i]) return VK_NULL_HANDLE;
@@ -793,11 +885,12 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
 }
 
 // (tameem) A draw's program has both its shader libraries kept from the all-shaders step: its pipeline is a link away
-bool all_shaders_linkable(const Program& p, const Targets& at) {
+bool all_shaders_linkable(const Program& p, const NvnState& s, const Targets& at) {
     if (!all_shaders_done.load(std::memory_order_acquire)) return false;
     const uint64_t program = mix(p.key, p.variant);
+    const bool dither = a2c_dithers(p, s, at);   // (tameem: its dithered fragment library is made at the link, on the worker)
     std::lock_guard lk(gpl_mu);
-    return gpl_libs.count(mix(program, 1)) && gpl_libs.count(mix(mix(program, (uint64_t)at.samples), 2));
+    return gpl_libs.count(mix(program, 1)) && (dither || gpl_libs.count(mix(mix(program, (uint64_t)at.samples), 2)));
 }
 bool all_shaders_full_wanted() {   // (the optimised whole pipeline after the linked one. RX_VK_ALL_SHADERS_FULL=0: linked only)
     static const bool on = !getenv("RX_VK_ALL_SHADERS_FULL") || atoi(getenv("RX_VK_ALL_SHADERS_FULL")) != 0;
@@ -843,6 +936,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
     if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
     if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
+    if (a2c_dithers(p, s, at)) key = mix(key, 0xa2cd17e1ull);   // (tameem: the dithered fragment shader)
     static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(key); m != mine.end()) return m->second;
     ParLock lk;
@@ -855,7 +949,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     // two kept libraries on a worker, at the front of the queue (no shader is compiled for it, only the vertex layout and the targets
     // are added), and the draw goes ahead a frame or so later; the optimised whole pipeline follows from the background lane and takes
     // its place (the linked one is left alone: draws recorded with it may still be on their way)
-    if (all_shaders_linkable(p, at) && !getenv("RX_VK_SYNC_PIPELINES")) {
+    if (all_shaders_linkable(p, s, at) && !getenv("RX_VK_SYNC_PIPELINES")) {
         struct LinkJob {
             PipeEntry* e;
             const Program* p;
@@ -954,10 +1048,11 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const Shader::Info& vs = p.stages[0].info;
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
+    const bool dither = a2c_dithers(p, s, at);   // (tameem: the fragment shader's dithered copy, alpha-to-coverage off)
     for (const Stage& st : p.stages) {
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
-        si.module = st.module;
+        si.module = dither && st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT ? a2c::dithered(st.module) : st.module;
         si.pName = "main";
         pin_subgroup(si);
         stages.push_back(si);
@@ -1027,7 +1122,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     if (dev.provoking_vertex) rs.pNext = &pvs;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = at.samples;
-    ms.alphaToCoverageEnable = s.ms.a2c && !dev.eds3_a2c && !no_a2c();
+    ms.alphaToCoverageEnable = s.ms.a2c && !dev.eds3_a2c && !no_a2c() && !dither;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cb[8]{};
     for (int i = 0; i < at.n; i++) {
@@ -2403,7 +2498,7 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     d.poly = s.poly.mode == 0 ? VK_POLYGON_MODE_POINT : s.poly.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     static const bool fp_lines = getenv("RX_VK_FOOTPRINT_LINES") != nullptr;   // (the footprints as wireframes)
     if (fp && fp_lines) d.poly = VK_POLYGON_MODE_LINE;
-    d.clamp = s.depth_clamp, d.a2c = s.ms.a2c != 0 && !no_a2c();
+    d.clamp = s.depth_clamp, d.a2c = s.ms.a2c != 0 && !no_a2c() && !(cur_program && a2c_dithers(*cur_program, s, at));   // (tameem)
     d.n = dev.eds3_blend ? at.n : 0;
     for (int i = 0; i < d.n; i++) {
         const nvn_blend_st& b = s.blend[i];
@@ -5131,6 +5226,7 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
 
 void precompile_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
+    a2c::begin();   // (tameem: the game's fragment shaders' code kept from here, for their dithered copies)
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach
     // 542 of 543 and the game close. The file says this step began and did not end: the next start lets the notes go and plays)
     const std::string running = pipe_notes_path() + ".running";
