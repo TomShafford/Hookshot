@@ -42,6 +42,10 @@ thread_local PointerDiag g_pointer_diag{};
 extern thread_local u32 g_nvn2_compute_ssbo_base;
 extern thread_local u32 g_nvn2_compute_ssbo_count;
 extern thread_local bool g_all_global_this;   // (RX_VK_ALL_GLOBAL_PROGS, vk_shader.cpp: no access of this program bound)
+/// (tameem) Task and mesh programs: how many of this thread's last translations' addresses had a constant buffer word that is
+/// an offset, not a storage buffer's address (HighFromDescriptor below), left to the run-time search. Read and reset by
+/// gpu/vk/vk_shader.cpp around each mesh program, declared there by hand as g_pointer_diag is
+thread_local u32 g_mesh_offsets_refused{};
 
 namespace {
 bool PointerDiagOn() {
@@ -328,6 +332,7 @@ bool MeetsBias(const StorageBufferAddr& storage_buffer, const Bias& bias) noexce
 struct LowAddrInfo {
     IR::U32 value;
     s32 imm_offset;
+    IR::Value high;   // (tameem: the address's high word, HighFromDescriptor)
 };
 
 /// Tries to track the first 32-bits of a global memory instruction
@@ -373,6 +378,7 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
     return LowAddrInfo{
         .value{IR::U32{addr_inst->Arg(0)}},
         .imm_offset = imm_offset,
+        .high{addr_inst->Arg(1)},
     };
 }
 
@@ -453,6 +459,44 @@ std::optional<StorageBufferAddr> TrackTable(const IR::Value& value) {
         return std::nullopt;
     }};
     return BreadthFirstSearch(value, pred);
+}
+
+/// (tameem) Whether an address's high word is its descriptor's: the constant buffer word beside the low one found, at offset + 4
+/// (or the same 64-bit read), plus a carry at most. A storage buffer is bound by both words, so only then is the binding the address
+/// the program made. Not so, the word found is an offset added to an address from elsewhere: OoT's six grass and foliage mesh
+/// programs (68642bb810ee3e7c, 6b4dea601798c255, 51183fe750d5d0c8, 4f0c0b40ab3a32cd, 739acd678ae08655, d905f52b7517c681) had
+/// c5+0x60, +0x1d0 or +0x228 bound as their buffers, words that hold floats and draw counts (0x10001c00a, size 1.0f: "storage
+/// buffer NOT bound (reads zeros)" at every draw), and read zeros where their data is
+bool HighFromDescriptor(const IR::Value& high, const StorageBufferAddr& descriptor) {
+    const auto pred{[&descriptor](const IR::Inst* inst) -> std::optional<bool> {
+        const IR::Opcode op{inst->GetOpcode()};
+        if (op != IR::Opcode::GetCbufU32 && op != IR::Opcode::GetCbufU32x2) {
+            return std::nullopt;
+        }
+        const IR::Value index{inst->Arg(0)};
+        const IR::Value offset{inst->Arg(1)};
+        if (!index.IsImmediate() || !offset.IsImmediate() || index.U32() != descriptor.index) {
+            return std::nullopt;
+        }
+        const u32 want{op == IR::Opcode::GetCbufU32x2 ? descriptor.offset : descriptor.offset + 4};
+        if (offset.U32() != want) {
+            return std::nullopt;
+        }
+        return true;
+    }};
+    // (not through a word loaded from memory, another address's, nor through the carry out of the low word's add, which reaches
+    // back to the low word's own sources: the offset found there is no high word)
+    const auto high_side = [](IR::Value operand) {
+        if (!operand.IsImmediate()) {
+            const IR::Inst& inst{*operand.InstRecursive()};
+            if (IsGlobalMemory(inst) || inst.GetOpcode() == IR::Opcode::GetCarryFromOp ||
+                inst.GetOpcode() == IR::Opcode::GetOverflowFromOp) {
+                return IR::Value{u32{0}};
+            }
+        }
+        return operand;
+    };
+    return BreadthFirstSearch(high, pred, high_side).value_or(false);
 }
 
 /// (EvilOOT, RX_VK_PTR_DIAG) Where an address comes from: constant buffer words, memory (a global load: a pointer loaded
@@ -584,6 +628,9 @@ bool MixesLoadedPointer(const IR::Value& value) {
 }
 
 thread_local bool g_follow_stage = false;   // (hookshot: the program being translated is compute, where the page table is)
+// (tameem) the program being translated is a task or mesh stage: where its NVN2 storage buffer table is in c0 (0x670 task, 0x770
+// mesh: translate_program.cpp AddNVNStorageBuffers, vk_bank.cpp kSsboTable), 0 otherwise
+thread_local u32 g_task_mesh_table = 0;
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
@@ -625,7 +672,16 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         .offset_end = g_nvn2_compute_ssbo_base + 16 * g_nvn2_compute_ssbo_count,
         .alignment = 16,
     };
-    const Bias* const bias{g_nvn2_compute_ssbo_base ? &compute_bias : &nvn_bias};
+    // (tameem) task and mesh: their own table, 16 slots from c0+0x670 or c0+0x770. Maxwell's 0x100..0x700 missed the mesh table
+    // whole (and the task table's last seven slots), so every access there went to the unbiased track, which took whatever
+    // constant buffer word it met first: a mesh program that adds an offset from its own constants took the offset
+    const Bias task_mesh_bias{
+        .index = 0,
+        .offset_begin = g_task_mesh_table,
+        .offset_end = g_task_mesh_table + 16 * 16,
+        .alignment = 16,
+    };
+    const Bias* const bias{g_nvn2_compute_ssbo_base ? &compute_bias : g_task_mesh_table ? &task_mesh_bias : &nvn_bias};
     {
         // (only where the page table is: compute. A graphics stage reads such a load as 0, and that blanked every menu text)
         static const bool follow{std::getenv("RX_VK_NO_FOLLOW") == nullptr};
@@ -665,6 +721,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         // c1 in the address is an offset (OoT's culling passes: a pointer loaded from memory + c1[0] = 12, taken for the
         // base: their results went to a buffer at address 12). Left to the run-time search, which finds the real one.
         if (storage_buffer && storage_buffer->index == 1) {
+            storage_buffer.reset();
+        }
+        // (tameem) task and mesh: a word whose neighbour is not the address's high word is an offset (HighFromDescriptor), and the
+        // address is left to the run-time search (the stage's table, its tables, the pointer table's pools) like any other not tracked
+        if (storage_buffer && g_task_mesh_table && !HighFromDescriptor(low_addr_info->high, *storage_buffer)) {
+            ++g_mesh_offsets_refused;
             storage_buffer.reset();
         }
         if (!storage_buffer) {
@@ -819,6 +881,7 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
 void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info) {
     static const bool no_mesh{std::getenv("RX_VK_FOLLOW_MESH") == nullptr};
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
+    g_task_mesh_table = program.stage == Stage::Task ? 0x670U : program.stage == Stage::Mesh ? 0x770U : 0U;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     StorageInfo info;
     for (IR::Block* const block : program.post_order_blocks) {

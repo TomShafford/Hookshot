@@ -59,6 +59,7 @@ extern thread_local uint32_t g_nvn2_compute_ssbo_count;
 extern thread_local uint32_t g_nvn2_compute_layout_end;
 extern thread_local bool g_nvn2_miss_log_this;
 extern thread_local bool g_all_global_this;
+extern thread_local uint32_t g_mesh_offsets_refused;   // (tameem: task and mesh offsets not taken for buffers, HighFromDescriptor)
 }
 namespace mkwvk {
 struct NvnState;
@@ -69,7 +70,7 @@ bool ptr_diag_on() {
     static const bool on = getenv("RX_VK_PTR_DIAG") && atoi(getenv("RX_VK_PTR_DIAG")) != 0;
     return on;
 }
-void ptr_diag_reset() { Shader::Optimization::g_pointer_diag = {}; }
+void ptr_diag_reset() { Shader::Optimization::g_pointer_diag = {}, Shader::Optimization::g_mesh_offsets_refused = 0; }
 /// One line a program whose global memory accesses are not all plain constant buffer pointers
 void ptr_diag_log(uint64_t key, const char* kind) {
     if (!ptr_diag_on()) return;
@@ -781,6 +782,10 @@ void oot_visual(Shader::IR::Program& program, uint64_t key) {
 // already kept (mkw_vk_pipelines.bin). Written as made; good for this translator (HOOKSHOT_SHADER_STAMP) and these switches only
 // (a file made by another starts again). RX_VK_NO_PROGRAM_CACHE=1: off ----
 struct DiskRecord { int64_t at; size_t size; uint32_t kind; };
+// (tameem) A record's kind: 1 compute, 2 mesh, and 4: made by a translator with the task and mesh storage buffer fix (11-08,
+// global_memory_to_storage_buffer_pass.cpp HighFromDescriptor). The shader stamp was kept for it (gpu/vk/stamp_base), so the hours
+// of translated programs stay: only the mesh programs the fix changes are translated again (stale_mesh_record)
+constexpr uint32_t kKindMeshBufferFix = 4;
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
@@ -942,7 +947,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0)));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -963,7 +968,8 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fwrite(o.data(), 1, o.size(), disk_out);
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
-    if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0))});
+    if (disk_listing)
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix)});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1001,6 +1007,29 @@ std::unique_ptr<Program> program_from_record(uint64_t key, const std::vector<uin
     return p;
 }
 
+/// (tameem) A mesh program kept before the task and mesh storage buffer fix that the fix changes: a task or mesh stage with a buffer
+/// bound from anywhere but its own table in c0 (0x670 task, 0x770 mesh). What its translation took for a buffer there may be an
+/// offset (OoT's grass: c5+0x60 bound, zeros read), so it is translated again; programs whose buffers are all their table's
+/// translate as before and keep their record
+bool stale_mesh_record(uint32_t kind, const Program& p) {
+    if (!(kind & 2) || (kind & kKindMeshBufferFix)) return false;
+    for (const Stage& st : p.stages) {
+        if (st.nvn_stage != 6 && st.nvn_stage != 7) continue;
+        const uint32_t table = st.nvn_stage == 6 ? 0x670 : 0x770;
+        for (const auto& d : st.info.storage_buffers_descriptors)
+            if (d.count == 1 && !(d.cbuf_index == 0 && d.cbuf_offset >= table && d.cbuf_offset < table + 16 * 16)) return true;
+    }
+    return false;
+}
+std::atomic<int> st_stale_mesh{0};
+void drop_stale(uint64_t key, std::unique_ptr<Program>& p) {
+    for (Stage& st : p->stages)
+        if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
+    p.reset();
+    if (st_stale_mesh++ < 60) logf("vk: mesh program %016llx: its record from before the storage buffer fix left out (translated again where no newer one is kept)",
+                                     (unsigned long long)key);
+}
+
 void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants) {
     disk_init();
     if (!disk_on) return;
@@ -1020,6 +1049,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         auto p = program_from_record(key, data);
+        if (p && stale_mesh_record(d.kind, *p)) drop_stale(key, p);
         if (!p) continue;
         variants.push_back(std::move(p));
         st_cache_hits++;
@@ -1059,6 +1089,11 @@ size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsi
             }
             if (read)
                 if (std::unique_ptr<Program> p = program_from_record(recs[i].first, data)) {
+                    if (stale_mesh_record(recs[i].second.kind, *p)) {   // (translated again at its first draw: no pipeline for this one)
+                        drop_stale(recs[i].first, p);
+                        done++;
+                        continue;
+                    }
                     fn(*p);
                     for (Stage& st : p->stages)
                         if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
@@ -1372,6 +1407,12 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         record_answers(p, s);   // (task questions not counted: kept conservative)
         (void)questions;
         ptr_diag_log(p.key, task ? "task+mesh" : "mesh");
+        if (const uint32_t refused = Shader::Optimization::g_mesh_offsets_refused) {   // (tameem: HighFromDescriptor)
+            static std::atomic<int> told{0};
+            if (told++ < 60)
+                logf("vk: mesh program %016llx: %u address(es) with an offset from a constant buffer left to the run-time search, "
+                     "not bound as that word's buffer", (unsigned long long)p.key, refused);
+        }
         program_cache_save(p, kept);
         // (where its stages read their storage buffers: the driver bank layout of NVN2's stages 6 and 7)
         static std::atomic<int> logged_ssbo;
