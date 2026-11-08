@@ -1033,9 +1033,9 @@ void shader_report() {   // (every 64 new pipelines met in play: how they were m
          b ? st_bg_full_us.load() / 1000.0 / (double)b : 0.0, jobs_background_pending());
 }
 
-/// The pipeline entry of a draw (a new one is queued for a worker; RX_VK_SYNC_PIPELINES=1 builds it here)
-PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
-    // the key: what is baked into it (the rest is dynamic state)
+/// The key of a draw's pipeline: what is baked into it (the rest is dynamic state). (tameem: its own function, so the precompile can
+/// tell which kept program a remembered pipeline was made from)
+uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
     // one ran another's shaders under its own descriptors)
     uint64_t key = mix(program_ident(p), (uint64_t)topology_class(topo) << 8 | (uint64_t)at.samples);
@@ -1063,6 +1063,12 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
     if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
     if (a2c_dithers(p, s, at)) key = mix(key, 0xa2cd17e1ull);   // (tameem: the dithered fragment shader)
+    return key;
+}
+
+/// The pipeline entry of a draw (a new one is queued for a worker; RX_VK_SYNC_PIPELINES=1 builds it here)
+PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+    const uint64_t key = pipeline_key(p, s, at, topo);
     static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(key); m != mine.end()) return m->second;
     ParLock lk;
@@ -5441,6 +5447,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         if (p.compute && !taau_key(p.key)) computes.push_back(&p);   // (tameem: a stood-in network is never compiled)
     });
     std::atomic<size_t> compiled{0};   // (tameem: those not in the cache)
+    std::atomic<size_t> unmatched{0}, not_first{0};   // (tameem: notes no kept program's key matches; those made from another than the first)
     const size_t total = notes.size() + computes.size();
     std::atomic<size_t> next{0}, done{0};
     const auto worker = [&] {
@@ -5461,14 +5468,25 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 else if (std::chrono::steady_clock::now() - t1 > std::chrono::milliseconds(20)) compiled++, pcache_built_since_save++;
             } else {
                 PipeNote& n = *notes[i - computes.size()];
-                const Program* p = program_find(n.prog, n.variant);
+                Targets at{};
+                at.n = (int)n.n;
+                at.samples = (VkSampleCountFlagBits)n.samples;
+                at.depth_format = (VkFormat)n.depth_format;
+                at.depth = n.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
+                for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
+                // (tameem) the kept program this pipeline was made from: the one whose pipeline key is the note's. The first of that key
+                // and variant was taken, and a translation from before the marker fix shares both with the one made for it, is kept
+                // ahead of it in the file and read back with it here: its pipeline went in under the new one's key, and the draws took
+                // it (OoT's wheat and flower heads cyan again from the second start on). None matching: left to its first draw
+                const Program* p = nullptr;
+                {
+                    const std::vector<const Program*> cands = program_find_all(n.prog, n.variant);
+                    for (const Program* c : cands)
+                        if (pipeline_key(*c, n.s, at, (VkPrimitiveTopology)n.topo) == n.key) { p = c; break; }
+                    if (!p && !cands.empty()) unmatched++;
+                    else if (p && p != cands.front()) not_first++;
+                }
                 if (p) {
-                    Targets at{};
-                    at.n = (int)n.n;
-                    at.samples = (VkSampleCountFlagBits)n.samples;
-                    at.depth_format = (VkFormat)n.depth_format;
-                    at.depth = n.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
-                    for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
                     const VkPipeline made = build_graphics(*p, n.s, at, (VkPrimitiveTopology)n.topo);
                     std::lock_guard lk(note_mu);
                     auto it = pipelines.find(n.key);
@@ -5494,6 +5512,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     for (std::thread& t : threads) t.join();
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines (%zu compiled, not in the cache) in %.0f ms", programs_n,
          notes.size(), computes.size(), compiled.load(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (unmatched.load() || not_first.load())
+        logf("vk: precompile: %zu pipelines made from a kept program other than the first of its key and variant (the marker fix's), %zu left "
+             "to their first draw (no kept program's key matches)", not_first.load(), unmatched.load());
     if (compiled.load()) pipeline_cache_save(false);
 }
 

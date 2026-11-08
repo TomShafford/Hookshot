@@ -88,6 +88,9 @@ void seed_close();
 /// Program i of the seed, translated and kept for the default state (null: kept already, or it does not translate); its modules are yours
 std::unique_ptr<Program> seed_program(size_t i, int inputs = 0);
 const Program* program_find(uint64_t key, uint64_t variant);
+/// (tameem) Every ready program of that key and variant: a translation kept from before the marker fix shares both with the one made
+/// for it (program_ident tells them apart)
+std::vector<const Program*> program_find_all(uint64_t key, uint64_t variant);
 /// The NVN stages of the bound program, for logs (stage field of each control section)
 void log_program_stages(const NvnState& s, const char* why);
 Shader::AttributeType attribute_type_of(uint32_t vattr);

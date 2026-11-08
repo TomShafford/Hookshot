@@ -2022,6 +2022,15 @@ const Program* program_find(uint64_t key, uint64_t variant) {
         if (p->variant == variant && p->ready.load(std::memory_order_acquire) && !p->failed) return p.get();
     return nullptr;
 }
+std::vector<const Program*> program_find_all(uint64_t key, uint64_t variant) {
+    std::vector<const Program*> out;
+    std::lock_guard lk(shader_mu);
+    auto it = programs.find(key);
+    if (it == programs.end()) return out;
+    for (auto& p : it->second)
+        if (p->variant == variant && p->ready.load(std::memory_order_acquire) && !p->failed) out.push_back(p.get());
+    return out;
+}
 
 void shader_stats(int64_t* translated, int64_t* failed) {
     static int64_t hits_logged;
