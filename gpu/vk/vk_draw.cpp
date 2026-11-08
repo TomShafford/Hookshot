@@ -691,8 +691,8 @@ std::unordered_map<VkShaderModule, VkShaderModule> patched;        // (original 
 uint64_t bytes = 0;
 PFN_vkCreateShaderModule real_create = nullptr;
 PFN_vkDestroyShaderModule real_destroy = nullptr;
-bool on() {
-    static const bool v = !getenv("RX_VK_A2C_DITHER") || atoi(getenv("RX_VK_A2C_DITHER")) != 0;
+bool on() {   // (11-08: off by default. OoT makes no alpha-to-coverage draw, and the capture kept up to 1 GB of fragment code. =1: on)
+    static const bool v = getenv("RX_VK_A2C_DITHER") && atoi(getenv("RX_VK_A2C_DITHER")) != 0;
     return v;
 }
 VKAPI_ATTR VkResult VKAPI_CALL create(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* al, VkShaderModule* m) {
