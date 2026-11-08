@@ -506,6 +506,90 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
     return m;
 }
 
+/// (tameem) A program key in a list of hex prefixes (comma separated); "all" every program, "mesh" every mesh program
+bool key_in_list(const char* list, uint64_t key, bool mesh) {
+    if (!list || !*list) return false;
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
+    for (const char* q = list; *q;) {
+        while (*q == ',' || *q == ' ' || *q == ';') q++;
+        const char* e = q;
+        while (*e && *e != ',' && *e != ' ' && *e != ';') e++;
+        const size_t n = (size_t)(e - q);
+        if (n == 3 && !strncmp(q, "all", 3)) return true;
+        if (n == 4 && !strncmp(q, "mesh", 4) && mesh) return true;
+        if (n && n <= 16 && !strncmp(hex, q, n)) return true;
+        q = e;
+    }
+    return false;
+}
+
+/// (tameem) The Position output of a stage decorated Invariant: the same position math in two programs gives the same bits. OoT
+/// draws its foliage twice, a depth pre-pass and then the colour with depth EQUAL; where AMD's compiler orders a swaying vertex's
+/// math differently in the two (the tall grass tops: the stems do not sway), equal fails and the G-buffer keeps its clear, the
+/// tops' white-cyan glow (issue 302). The console's compiler keeps them the same. Only output variables; one already Invariant left
+std::vector<uint32_t> invariant_position(const std::vector<uint32_t>& in, int& added) {
+    added = 0;
+    if (in.size() < 5 || in[0] != 0x07230203u) return in;
+    std::unordered_set<uint32_t> outputs, invariant, position;
+    for (size_t i = 5; i < in.size();) {
+        const uint32_t wc = in[i] >> 16, op = in[i] & 0xffffu;
+        if (!wc || i + wc > in.size()) return in;
+        if (op == 59 && wc >= 4 && in[i + 3] == 3) outputs.insert(in[i + 2]);                   // OpVariable ... Output
+        if (op == 71 && wc >= 3 && in[i + 2] == 18) invariant.insert(in[i + 1]);                // OpDecorate %x Invariant
+        if (op == 71 && wc >= 4 && in[i + 2] == 11 && in[i + 3] == 0) position.insert(in[i + 1]);   // BuiltIn Position
+        i += wc;
+    }
+    std::vector<uint32_t> out(in.begin(), in.begin() + 5);
+    out.reserve(in.size() + 6);
+    for (size_t i = 5; i < in.size();) {
+        const uint32_t wc = in[i] >> 16, op = in[i] & 0xffffu;
+        out.insert(out.end(), in.begin() + i, in.begin() + i + wc);
+        if (op == 71 && wc >= 4 && in[i + 2] == 11 && in[i + 3] == 0) {
+            const uint32_t id = in[i + 1];
+            if (outputs.count(id) && invariant.insert(id).second) {
+                out.push_back((3u << 16) | 71u), out.push_back(id), out.push_back(18u);
+                added++;
+            }
+        }
+        i += wc;
+    }
+    return added ? out : in;
+}
+
+/// (tameem) A stage's module, for program key: RX_VK_INVARIANT=<keys>|mesh|all (unset: off): its Position Invariant
+/// (invariant_position; the program cache keeps the SPIR-V as translated; a changed module is a new pipeline for the driver). RX_VK_SPV=<keys>: the SPIR-V written to
+/// spv_<key>_<stage>.spv in the working folder as the module is made (kept programs too: nothing translated again), for spirv-dis
+VkShaderModule make_stage_module(const std::vector<uint32_t>& spirv, uint64_t key, bool mesh, VkShaderStageFlagBits stage) {
+    static const char* invariant_list = [] {
+        const char* e = getenv("RX_VK_INVARIANT");
+        return !e || !strcmp(e, "0") ? "" : e;
+    }();
+    static const char* spv_list = getenv("RX_VK_SPV");
+    const char* name = stage == VK_SHADER_STAGE_TASK_BIT_EXT ? "task" : stage == VK_SHADER_STAGE_MESH_BIT_EXT ? "mesh"
+                     : stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex" : stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fragment"
+                     : stage == VK_SHADER_STAGE_COMPUTE_BIT ? "compute" : "other";
+    if (spv_list && key_in_list(spv_list, key, mesh)) {
+        char path[96];
+        snprintf(path, sizeof path, "spv_%016llx_%s.spv", (unsigned long long)key, name);
+        if (FILE* f = fopen(path, "wb")) {
+            fwrite(spirv.data(), 4, spirv.size(), f), fclose(f);
+            logf("vk: SPIR-V of program %016llx, %s stage, written to %s", (unsigned long long)key, name, path);
+        }
+    }
+    if (*invariant_list && (stage == VK_SHADER_STAGE_MESH_BIT_EXT || stage == VK_SHADER_STAGE_VERTEX_BIT) &&
+        key_in_list(invariant_list, key, mesh)) {
+        int added = 0;
+        const std::vector<uint32_t> patched = invariant_position(spirv, added);
+        static std::atomic<int> told{0};
+        if (added && told++ < 8)
+            logf("vk: program %016llx: %s stage's position invariant (RX_VK_INVARIANT=%s; this message 8 times)",
+                 (unsigned long long)key, name, invariant_list);
+        if (added) return make_module(patched);
+    }
+    return make_module(spirv);
+}
+
 } // namespace
 
 /// A word of a stage's constant bank: c0 / c2 the driver's banks, c1 its own constants, c3.. its uniform buffers
@@ -1043,7 +1127,7 @@ std::unique_ptr<Program> program_from_record(uint64_t key, const std::vector<uin
         r.list(spirv);
         r.list(st.c1);
         get_info(r, st.info);
-        st.module = make_module(spirv);
+        st.module = make_stage_module(spirv, key, p->mesh, st.vk_stage);
         ok = ok && st.module;
     }
     if (!ok) {
@@ -1277,7 +1361,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                          bi ? " base instance" : "", di ? " draw index" : "");
             }
             v.info = vs->program.info;
-            v.module = make_module(vspirv);
+            v.module = make_stage_module(vspirv, p.key, false, VK_SHADER_STAGE_VERTEX_BIT);
             kept.push_back(vspirv);
             v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
             v.c1 = vsc->c1;
@@ -1302,7 +1386,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Stage f;
                 f.nvn_stage = 1;
                 f.info = fs->program.info;
-                f.module = make_module(fspirv);
+                f.module = make_stage_module(fspirv, p.key, false, VK_SHADER_STAGE_FRAGMENT_BIT);
                 kept.push_back(fspirv);
                 f.vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
                 f.c1 = fsc->c1;
@@ -1400,7 +1484,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             Stage st;
             st.nvn_stage = bank_stage(*task);
             st.info = task_t->program.info;
-            st.module = make_module(spirv);
+            st.module = make_stage_module(spirv, p.key, true, VK_SHADER_STAGE_TASK_BIT_EXT);
             st.vk_stage = VK_SHADER_STAGE_TASK_BIT_EXT;
             st.c1 = task->c1;
             p.stages.push_back(std::move(st));
@@ -1432,7 +1516,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         Stage ms;
         ms.nvn_stage = bank_stage(mesh);
         ms.info = mesh_t->program.info;
-        ms.module = make_module(mspirv);
+        ms.module = make_stage_module(mspirv, p.key, true, VK_SHADER_STAGE_MESH_BIT_EXT);
         ms.vk_stage = VK_SHADER_STAGE_MESH_BIT_EXT;
         ms.c1 = mesh.c1;
         p.stages.push_back(std::move(ms));
@@ -1461,7 +1545,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             Stage f;
             f.nvn_stage = 1;
             f.info = fs->program.info;
-            f.module = make_module(fspirv);
+            f.module = make_stage_module(fspirv, p.key, true, VK_SHADER_STAGE_FRAGMENT_BIT);
             f.vk_stage = VK_SHADER_STAGE_FRAGMENT_BIT;
             f.c1 = fsc->c1;
             p.stages.push_back(std::move(f));

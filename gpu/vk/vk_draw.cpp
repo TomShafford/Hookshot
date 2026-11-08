@@ -24,6 +24,7 @@
 #include <thread>
 #include <array>
 #include <cmath>
+#include <cctype>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
@@ -212,50 +213,102 @@ bool stats_prog_wanted(uint64_t key) {
     return std::find(want.begin(), want.end(), key) != want.end();
 }
 bool stats_frame_now();   // (below: the frame being measured is the current one)
-/// (EvilOOT) RX_VK_SKIP_FILE=<file>: the draws of the programs listed in it (hex keys, comma or newline separated) left out,
-/// the file read again whenever it changes (checked every 300 ms): a bisection in one run, from the scene being looked at
-bool skip_live(uint64_t key) {
-    static const char* path = getenv("RX_VK_SKIP_FILE");
-    if (!path || !*path) return false;
-    static std::mutex mu;
-    static std::vector<uint64_t> keys;
-    static std::atomic<int64_t> next_check{0};
-    static int64_t last_size = -1, last_time = -1;
-    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    std::lock_guard lk(mu);
-    if (now >= next_check.load(std::memory_order_relaxed)) {
-        next_check.store(now + 300, std::memory_order_relaxed);
-        // (size and write time, portably: the Linux build has no GetFileAttributesExA)
-        std::error_code ec;
-        const auto fsize = std::filesystem::file_size(path, ec);
-        const auto ftime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
-        if (!ec) {
-            const int64_t size = (int64_t)fsize;
-            const int64_t time = (int64_t)ftime.time_since_epoch().count();
-            if (size != last_size || time != last_time) {
-                last_size = size, last_time = time;
-                keys.clear();
-                if (FILE* f = fopen(path, "rb")) {
-                    std::string text;
-                    char buf[4096];
-                    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
-                    fclose(f);
-                    for (const char* q = text.c_str(); *q;) {
-                        char* e;
-                        const uint64_t k = strtoull(q, &e, 16);
-                        if (e == q) { q++; continue; }
-                        keys.push_back(k);
-                        q = e;
-                    }
-                    std::sort(keys.begin(), keys.end());
-                }
-                logf("vk: RX_VK_SKIP_FILE: %zu programs left out now", keys.size());
-            }
-        } else if (!keys.empty()) {
-            keys.clear(), last_size = last_time = -1;
-        }
+/// (EvilOOT; tameem: shared) Program keys listed in a file, read again whenever it changes (checked every 300 ms): a bisection
+/// in one run, from the scene being looked at. A key is a hex word of 8 digits or more; a word after it (not hex) is that key's;
+/// '#' starts a comment to the end of the line
+struct LiveList {
+    const char* env;
+    const char* path;
+    std::mutex mu;
+    std::vector<std::pair<uint64_t, std::string>> keys;   // (sorted by key)
+    int64_t next_check = 0, last_size = -1, last_time = -1;
+    explicit LiveList(const char* e) : env(e), path(getenv(e)) {}
+    static bool hex_word(const std::string& w) {
+        size_t i = w.size() > 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X') ? 2 : 0;
+        if (w.size() - i < 8 || w.size() - i > 16) return false;
+        for (; i < w.size(); i++)
+            if (!isxdigit((unsigned char)w[i])) return false;
+        return true;
     }
-    return std::binary_search(keys.begin(), keys.end(), key);
+    void parse(const std::string& text) {
+        keys.clear();
+        std::string w;
+        auto flush = [&] {
+            if (w.empty()) return;
+            if (hex_word(w)) keys.emplace_back(strtoull(w.c_str(), nullptr, 16), std::string{});
+            else if (!keys.empty() && keys.back().second.empty()) {
+                for (char& c : w) c = (char)tolower((unsigned char)c);
+                keys.back().second = w;
+            }
+            w.clear();
+        };
+        bool comment = false;
+        for (const char c : text) {
+            if (c == '\n' || c == '\r') comment = false;
+            if (comment) continue;
+            if (c == '#') { flush(), comment = true; continue; }
+            if (c == ',' || c == ';' || c == '=' || isspace((unsigned char)c)) flush();
+            else w += c;
+        }
+        flush();
+        std::stable_sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    /// key listed: its word to *word ("" none)
+    bool find(uint64_t key, std::string* word = nullptr) {
+        if (!path || !*path) return false;
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::lock_guard lk(mu);
+        if (now >= next_check) {
+            next_check = now + 300;
+            // (size and write time, portably: the Linux build has no GetFileAttributesExA)
+            std::error_code ec;
+            const auto fsize = std::filesystem::file_size(path, ec);
+            const auto ftime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+            if (!ec) {
+                const int64_t size = (int64_t)fsize;
+                const int64_t time = (int64_t)ftime.time_since_epoch().count();
+                if (size != last_size || time != last_time) {
+                    last_size = size, last_time = time;
+                    std::string text;
+                    if (FILE* f = fopen(path, "rb")) {
+                        char buf[4096];
+                        for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+                        fclose(f);
+                    }
+                    parse(text);
+                    logf("vk: %s: %zu programs listed now", env, keys.size());
+                }
+            } else if (!keys.empty()) {
+                keys.clear(), last_size = last_time = -1;
+            }
+        }
+        const auto it = std::lower_bound(keys.begin(), keys.end(), key, [](const auto& a, uint64_t k) { return a.first < k; });
+        if (it == keys.end() || it->first != key) return false;
+        if (word) *word = it->second;
+        return true;
+    }
+};
+/// (EvilOOT) RX_VK_SKIP_FILE=<file>: the draws of the programs listed in it left out
+bool skip_live(uint64_t key) {
+    static LiveList list("RX_VK_SKIP_FILE");
+    return list.find(key);
+}
+/// (tameem) RX_VK_DEPTH_FILE=<file>: the depth test of the programs listed in it, live: "<key> always" (no word: always), le, ge,
+/// less, greater, equal, notequal, never. OoT's foliage colour passes test EQUAL against their depth pre-pass: one listed with always
+/// that then colours its tall grass tops places them where its pre-pass did not (the vertex math differs); still white, its
+/// fragments are not there at all
+bool depth_live(uint64_t key, VkCompareOp& op) {
+    static LiveList list("RX_VK_DEPTH_FILE");
+    std::string w;
+    if (!list.find(key, &w)) return false;
+    op = w == "le" || w == "lequal" || w == "less_or_equal" ? VK_COMPARE_OP_LESS_OR_EQUAL
+       : w == "ge" || w == "gequal" || w == "greater_or_equal" ? VK_COMPARE_OP_GREATER_OR_EQUAL
+       : w == "less" || w == "lt" ? VK_COMPARE_OP_LESS
+       : w == "greater" || w == "gt" ? VK_COMPARE_OP_GREATER
+       : w == "equal" || w == "eq" ? VK_COMPARE_OP_EQUAL
+       : w == "notequal" || w == "ne" ? VK_COMPARE_OP_NOT_EQUAL
+       : w == "never" ? VK_COMPARE_OP_NEVER : VK_COMPARE_OP_ALWAYS;
+    return true;
 }
 void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, bool written, bool table, uint32_t cbuf = 0,
                      uint32_t off = 0, uint64_t raw = 0, uint64_t vkbuf = 0, uint64_t vkoff = 0) {
@@ -2503,6 +2556,7 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     // the G-buffer keeps its clear: the grass tops' white-cyan glow)
     static const bool equal_le = getenv("RX_VK_DEPTH_EQUAL_LE") && atoi(getenv("RX_VK_DEPTH_EQUAL_LE")) != 0;
     if (equal_le && !d.dw && d.dop == VK_COMPARE_OP_EQUAL) d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
+    if (cur_program) depth_live(cur_program->key, d.dop);   // (tameem: RX_VK_DEPTH_FILE)
     if (fp) d.dt = true, d.dw = true, d.dop = VK_COMPARE_OP_ALWAYS;
     d.st = stencil && s.ds.st;
     d.sops[0][0] = stencil_op(s.ds.fail_f), d.sops[0][1] = stencil_op(s.ds.zpass_f), d.sops[0][2] = stencil_op(s.ds.zfail_f);
