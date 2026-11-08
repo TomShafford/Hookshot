@@ -35,6 +35,10 @@ struct Program {
     uint64_t key = 0;
     bool compute = false, failed = false;
     std::atomic<bool> ready{false};   // translated (graphics programs are translated on a worker: vk_jobs.h)
+    // (tameem) translated by a lowering with the marker fix (11-08), or read back from a record made by one: a program whose stages'
+    // lowering that fix changes is translated again when only an older one is held (vk_shader.cpp kKindMarkerFix). (In the padding
+    // after ready: the record layout and the cache's ABI sizes stay as they were)
+    bool marker_fixed = true;
     std::vector<Stage> stages;
     std::array<uint32_t, 3> workgroup{1, 1, 1};
     uint32_t shared_memory = 0;

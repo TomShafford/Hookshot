@@ -85,6 +85,9 @@ struct LoweredProgram {
     // (hookshot) the reserved numbers uniform_register gave, all instructions: what renamed registers' markers avoid
     std::array<bool, 256> used_reserved{};
     u32 register_map_words{};   // (hookshot: the REGMAP_nx2 prefixes emitted)
+    // (tameem) markers that the rule before 11-08 would have given a number one of the instruction's other fields holds: a program
+    // with any is translated differently since (its kept translation is made again: vk_shader.cpp kKindMarkerFix)
+    u32 marker_conflicts{};
     u32 error_offset{};
     std::string_view error;
 
@@ -182,6 +185,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (reg >= 255 || reg + 3 < reserved_base) continue;   // (a quad below may reach up)
                 if (register_field && reg >= reserved_base) any_high = true;
             }
+            // (tameem) every number the instruction's fields hold, each with its span, before any is renamed: a marker is none of
+            // them. It was checked against the high GPRs of the fields before its own only, and a scratch-range destination took
+            // the number of a high source read after it (OoT's flower heads: R252 = R216 * c got marker 216 beside the source
+            // R216's own run, the prefix mapped 216 to one register for both, and the card's corner lost its depth to its height)
+            std::array<bool, 256> named{};
+            for (u32 f = 0; f < 4; ++f) {
+                const u32 reg = insn.Bits(bits[f], 8);
+                for (u32 k = 0; reg < 255 && k < span_of(reg) && reg + k < 255; ++k) named[reg + k] = true;
+            }
             for (u32 f = 0; f < 4 && any_high; ++f) {
                 const u32 bit = bits[f], reg = insn.Bits(bit, 8);
                 if (reg >= 255 || reg + 3 < reserved_base) continue;
@@ -191,13 +203,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     reaches_scratch |= avoid[reg + k];
                 if ((renameable & (1U << f)) && reaches_scratch && reg >= reserved_base) {
                     // a marker block, aligned as the register, among the uniform bank's numbers nobody uses here
-                    u32 marker = 255;
-                    for (u32 m = 216; m + span <= 246 && marker == 255; m += span) {
-                        bool ok = true;
-                        for (u32 k = 0; k < span && ok; ++k)
-                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k];
-                        if (ok) marker = m;
+                    u32 marker = 255, before_fix = 255;   // (before_fix: the one taken before, without the other fields' numbers)
+                    for (u32 m = 216; m + span <= 246 && (marker == 255 || before_fix == 255); m += span) {
+                        bool ok = true, ok_before = true;
+                        for (u32 k = 0; k < span && (ok || ok_before); ++k) {
+                            ok_before = ok_before && m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k];
+                            ok = ok && m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k] && !named[m + k];
+                        }
+                        if (ok && marker == 255) marker = m;
+                        if (ok_before && before_fix == 255) before_fix = m;
                     }
+                    if (marker != before_fix) result.marker_conflicts++;
                     if (marker != 255 && nrenamed < 8) {
                         bool same = false;   // (the same register in two fields: one marker)
                         for (u32 r = 0; r < nrenamed; ++r)

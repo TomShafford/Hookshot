@@ -110,6 +110,7 @@ struct Code {
     // 31:16; +0x5f the output topology, 1 points, 3 triangles)
     uint32_t mesh_threads = 0, payload_bytes = 0, max_vertices = 0, max_primitives = 0, topology = 0;
     bool header_only = false;       // a graphics header and no code (NVN2's per-primitive output map of a mesh program)
+    bool marker_fix = false;        // (tameem) its lowering is one the marker fix changed (lower_to_maxwell.h marker_conflicts)
     uint8_t sph[sizeof(Shader::ProgramHeader)]{};
     bool ok = false;
 };
@@ -271,6 +272,15 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
         return c;
     }
     c.texture_bound = lowered.required_texture_buffer;
+    c.marker_fix = lowered.marker_conflicts != 0;
+    if (c.marker_fix) {
+        static std::mutex mu;
+        static std::unordered_set<uint64_t> told;
+        std::lock_guard lk(mu);
+        if (told.size() < 200 && told.insert(c.key).second)
+            logf("vk: NVN2 program %016llx (stage %u): %u extended registers renamed apart from the instruction's other registers (the "
+                 "marker fix); its programs kept from before it are translated again", (unsigned long long)c.key, st, lowered.marker_conflicts);
+    }
     c.code.assign(sizeof(Shader::ProgramHeader) / 8, 0);
     if (graphics) std::memcpy(c.code.data(), area.data(), sizeof(Shader::ProgramHeader));
     for (const uint64_t instruction : lowered.instructions) {
@@ -911,6 +921,12 @@ bool stale_mesh_record(uint32_t kind) { return (kind & 2) && !(kind & kKindMeshP
 // goes into hookshot_retranslate.txt beside the cache (program_mark_retranslate, vk_draw.cpp), and its record without 32 is left out
 // at the next start: translated again then. The rest keep theirs, however many vertex buffers they bind from the game's banks
 constexpr uint32_t kKindVertexOffsets = 32;
+// (tameem) and 64: made by a translator with the marker fix (11-08, lower_to_maxwell.h): an extended register's marker is none of the
+// numbers its instruction's fields hold. Before it a destination in the lowering's scratch range could take the number of a high source
+// of the same instruction, and the two became one register (OoT's flower heads, wheat and lavender: a card corner's depth overwritten,
+// the colour pass clipped away, the G-buffer left as the sky). A program whose stages' lowering it changes (Code::marker_fix) and that
+// is kept only without 64 is translated again at its first draw; the rest keep theirs
+constexpr uint32_t kKindMarkerFix = 64;
 std::mutex retrans_mu;
 std::unordered_set<uint64_t> retrans_keys;
 std::string retrans_path;
@@ -1104,7 +1120,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -1126,7 +1142,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing)
-        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets)});
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets | kKindMarkerFix)});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1173,7 +1189,7 @@ void drop_stale(uint64_t key, std::unique_ptr<Program>& p) {
                                      (unsigned long long)key);
 }
 
-void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants) {
+void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool lowering_changed = false) {
     disk_init();
     if (!disk_on) return;
     std::vector<DiskRecord> recs;
@@ -1185,6 +1201,12 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         disk_records.erase(it);
     }
     for (const DiskRecord& d : recs) {
+        if (lowering_changed && !(d.kind & kKindMarkerFix)) {   // (tameem: made before the marker fix, which changes this program)
+            static std::atomic<int> told{0};
+            if (told++ < 60) logf("vk: program %016llx: its kept translation is from before the marker fix, which changes it: translated again",
+                                  (unsigned long long)key);
+            continue;
+        }
         std::vector<uint8_t> data(d.size);
         {
             std::lock_guard lk(disk_mu);
@@ -1192,6 +1214,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         auto p = program_from_record(key, data);
+        if (p) p->marker_fixed = (d.kind & kKindMarkerFix) != 0;
         if (p && (stale_mesh_record(d.kind) || stale_vertex_record(d.kind, key))) drop_stale(key, p);
         if (!p) continue;
         variants.push_back(std::move(p));
@@ -1623,8 +1646,10 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     if (!mesh) return nullptr;
     const uint64_t key = mesh_key(task, *mesh, fsc, prim, color_types);
     auto& variants = programs[key];
-    program_cache_load(key, variants);
+    const bool lowering_changed = mesh->marker_fix || (task && task->marker_fix) || (fsc && fsc->marker_fix);   // (tameem, kKindMarkerFix)
+    program_cache_load(key, variants, lowering_changed);
     for (auto& p : variants) {
+        if (lowering_changed && !p->marker_fixed) continue;
         if (!p->ready.load(std::memory_order_acquire)) return p.get();
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
@@ -1781,8 +1806,12 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     // the variants of these stages, for these vertex input types and colour output types
     const uint64_t key = compute ? stage_code[5]->key : graphics_key(*stage_code[0], stage_code[1], s.vattr, color_types);
     auto& variants = programs[key];
-    program_cache_load(key, variants);
+    // (tameem) a stage whose lowering the marker fix changes: no translation from before it (kKindMarkerFix)
+    const bool lowering_changed = (stage_code[0] && stage_code[0]->marker_fix) || (stage_code[1] && stage_code[1]->marker_fix) ||
+                                  (stage_code[5] && stage_code[5]->marker_fix);
+    program_cache_load(key, variants, lowering_changed);
     for (auto& p : variants) {
+        if (lowering_changed && !p->marker_fixed) continue;   // (one read back before this program's codes were met: left as it is)
         if (!p->ready.load(std::memory_order_acquire)) return p.get();   // (being translated)
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
