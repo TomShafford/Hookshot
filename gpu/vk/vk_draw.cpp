@@ -198,6 +198,53 @@ void stats_dump_stage(uint64_t prog, const NvnState& s, int stage) {
     for (int i = 0; i < 16; i++) dump("ubo", i, s.ubo[stage][i]);
     for (int i = 0; i < 16; i++) dump("ssbo", i, s.ssbo[stage][i]);
 }
+/// (tameem) RX_VK_DUMP_UBO=<program keys>: in a frame dump, the uniform buffers of those programs' stages as their first draw
+/// of the frame binds them (as the shader reads them: the stream's inline updates in), 64 KB from each binding's start (or
+/// what can be read), to <RX_VK_DUMP_DIR>/ub_<frame>_<key>_s<stage>_c<n>.bin; the log's dump-ub line says where the binding
+/// is, the game's size for it, what the shader reads and the range its descriptor gets (the tall grass tops: their per-layer
+/// and per-instance tables)
+void dump_uniforms(const NvnState& s, const Program& p) {
+    static const char* list = getenv("RX_VK_DUMP_UBO");
+    if (!list || !*list) return;
+    char hex[24];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
+    if (!strstr(list, hex)) return;
+    const uint64_t f = texture_frame_no();
+    {
+        static std::mutex mu;
+        static std::unordered_set<uint64_t> done;
+        std::lock_guard lk(mu);
+        if (done.size() > 4096) done.clear();
+        if (!done.insert(p.key ^ (f * 0x9E3779B97F4A7C15ull)).second) return;
+    }
+    static const char* dir = getenv("RX_VK_DUMP_DIR");
+    for (const Stage& st : p.stages) {
+        const int ns = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+        for (uint32_t i = 3; i < 3 + 16 && i < Shader::Info::MAX_CBUFS; i++) {
+            const nvn_p_bind_buf& u = s.ubo[ns][i - 3];
+            const uint32_t used = st.info.constant_buffer_used_sizes[i];
+            if (!u.addr || !used) continue;
+            const uint64_t want = std::max<uint64_t>(used, 16);   // (as uniform_range)
+            const uint64_t range = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
+                                                      dev.props.limits.maxUniformBufferRange);
+            std::vector<uint8_t> b;
+            uint64_t n = 0x10000;
+            for (; n >= 256; n /= 2) {
+                b.assign(n, 0);
+                if (ub_read(u.addr, b.data(), n)) break;
+            }
+            char path[600];
+            snprintf(path, sizeof path, "%s%sub_%llu_%s_s%d_c%u.bin", dir ? dir : "", dir ? "\\" : "", (unsigned long long)f, hex,
+                     ns, i);
+            bool wrote = false;
+            if (n >= 256)
+                if (FILE* fp = fopen(path, "wb")) wrote = fwrite(b.data(), 1, n, fp) == n, fclose(fp);
+            logf("vk: dump-ub prog %s s%d c%u at %#llx size %#llx used %#x range %#llx: %#llx bytes %s %s", hex, ns, i,
+                 (unsigned long long)u.addr, (unsigned long long)u.size, used, (unsigned long long)range,
+                 (unsigned long long)(n >= 256 ? n : 0), wrote ? "written to" : "NOT written to", path);
+        }
+    }
+}
 bool stats_prog_wanted(uint64_t key) {
     static const std::vector<uint64_t> want = [] {
         std::vector<uint64_t> v;
@@ -4237,6 +4284,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     if (dump_on()) log_dump_draw(s, p, d);
+    if (dump_on()) dump_uniforms(s, p);   // (tameem: RX_VK_DUMP_UBO)
     PROF(PROF_CMDS);
     texture_watch_prog(p.key);
     if (!same_desc) gfx_sampled = draw_sampled;
