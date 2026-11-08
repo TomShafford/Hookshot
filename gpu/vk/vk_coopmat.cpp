@@ -15,7 +15,12 @@
 #include <string>
 #include <vector>
 
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+
 #include "vk_internal.h"
+#include "vk_mma16.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include <sirit/sirit.h>
 
@@ -328,6 +333,105 @@ bool test_multiply() {
 
 } // namespace
 
+// ---- (tameem) 16x16x16 cooperative matrices (AMD): the software function's body replaced as a module is made (vk_mma16.h) ----
+namespace {
+bool mma16_enabled = false, mma16_acc32 = false;
+PFN_vkCreateShaderModule mma16_real_create = nullptr;
+std::mutex mma16_mu;
+std::unordered_map<VkShaderModule, std::vector<uint32_t>> mma16_originals;   // (each patched module's own words: mma16_unpatched)
+
+VKAPI_ATTR VkResult VKAPI_CALL mma16_create_module(VkDevice device, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* alloc,
+                                                   VkShaderModule* module) {
+    if (ci && ci->pCode && ci->codeSize >= 20 && mma16::has_software_function(ci->pCode, ci->codeSize / 4)) {
+        std::vector<uint32_t> out;
+        std::string why;
+        static std::atomic<int> told{0};
+        if (mma16::patch(ci->pCode, ci->codeSize / 4, mma16_acc32, dev.props.limits.maxComputeSharedMemorySize, out, why)) {
+            VkShaderModuleCreateInfo patched = *ci;
+            patched.pCode = out.data();
+            patched.codeSize = out.size() * 4;
+            const VkResult r = mma16_real_create(device, &patched, alloc, module);
+            if (told++ < 20) logf("vk: a network's matrix multiplies on the matrix units: module %s", r == VK_SUCCESS ? "made" : "not made");
+            if (r == VK_SUCCESS) {
+                std::lock_guard lk(mma16_mu);
+                mma16_originals[*module].assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+                return r;
+            }
+        } else if (told++ < 20) {
+            logf("vk: a network's matrix multiplies stay in software: %s", why.c_str());
+        }
+    }
+    return mma16_real_create(device, ci, alloc, module);
+}
+
+// A module with the translator's software function (its body here a stand-in, d = c) called by 64 lanes, two subgroups: lane L
+// reads its 8 fragment words at 8L and writes D's 2 at 512 + 2L. Patched, run, and checked against the CPU for both subgroups
+// (each its own matrices: the subgroup's part of the shared array)
+std::vector<uint32_t> mma16_test_module() {
+    using namespace Sirit;
+    Module m{0x00010600};
+    m.AddCapability(spv::Capability::Shader);
+    m.AddCapability(spv::Capability::GroupNonUniform);
+    m.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    const Id void_t = m.TypeVoid(), u32 = m.TypeUInt(32), uvec2 = m.TypeVector(u32, 2), uvec3 = m.TypeVector(u32, 3),
+             uvec4 = m.TypeVector(u32, 4);
+    const auto c = [&](uint32_t v) { return m.Constant(u32, v); };
+    const Id runtime = m.TypeRuntimeArray(u32);
+    m.Decorate(runtime, spv::Decoration::ArrayStride, 4U);
+    const Id block = m.TypeStruct(runtime);
+    m.Decorate(block, spv::Decoration::Block);
+    m.MemberDecorate(block, 0U, spv::Decoration::Offset, 0U);
+    const Id buf = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::StorageBuffer, block), spv::StorageClass::StorageBuffer);
+    m.Decorate(buf, spv::Decoration::DescriptorSet, 0U);
+    m.Decorate(buf, spv::Decoration::Binding, 0U);
+    const Id word_ptr = m.TypePointer(spv::StorageClass::StorageBuffer, u32);
+    const Id lid = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Input, uvec3), spv::StorageClass::Input);
+    m.Decorate(lid, spv::Decoration::BuiltIn, spv::BuiltIn::LocalInvocationId);
+    const Id fn = m.OpFunction(uvec2, spv::FunctionControlMask::DontInline, m.TypeFunction(uvec2, uvec4, uvec2, uvec2));
+    m.OpFunctionParameter(uvec4);
+    m.OpFunctionParameter(uvec2);
+    const Id pc = m.OpFunctionParameter(uvec2);
+    m.AddLabel();
+    m.OpReturnValue(pc);
+    m.OpFunctionEnd();
+    const Id main = m.OpFunction(void_t, spv::FunctionControlMask::MaskNone, m.TypeFunction(void_t));
+    m.AddLabel();
+    const Id lane = m.OpCompositeExtract(u32, m.OpLoad(uvec3, lid), 0U);
+    const Id base = m.OpIMul(u32, lane, c(8));
+    const auto at = [&](Id b, uint32_t k) { return m.OpIAdd(u32, b, c(k)); };
+    const auto word = [&](Id i) { return m.OpLoad(u32, m.OpAccessChain(word_ptr, buf, c(0), i)); };
+    const Id a = m.OpCompositeConstruct(uvec4, word(base), word(at(base, 1)), word(at(base, 2)), word(at(base, 3)));
+    const Id b = m.OpCompositeConstruct(uvec2, word(at(base, 4)), word(at(base, 5)));
+    const Id cc = m.OpCompositeConstruct(uvec2, word(at(base, 6)), word(at(base, 7)));
+    const Id d = m.OpFunctionCall(uvec2, fn, a, b, cc);
+    const Id out = m.OpIAdd(u32, c(512), m.OpIMul(u32, lane, c(2)));
+    m.OpStore(m.OpAccessChain(word_ptr, buf, c(0), out), m.OpCompositeExtract(u32, d, 0U));
+    m.OpStore(m.OpAccessChain(word_ptr, buf, c(0), at(out, 1)), m.OpCompositeExtract(u32, d, 1U));
+    m.OpReturn();
+    m.OpFunctionEnd();
+    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", buf, lid);
+    m.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 64U, 1U, 1U);
+    return m.Assemble();
+}
+} // namespace
+
+bool mma16_active() {
+    return mma16_enabled;
+}
+VkShaderModule mma16_unpatched(VkShaderModule module) {
+    std::vector<uint32_t> words;
+    {
+        std::lock_guard lk(mma16_mu);
+        const auto it = mma16_originals.find(module);
+        if (it == mma16_originals.end()) return VK_NULL_HANDLE;
+        words = it->second;
+    }
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = words.size() * 4, ci.pCode = words.data();
+    VkShaderModule m = VK_NULL_HANDLE;
+    return mma16_real_create(dev.device, &ci, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
+}
+
 // (vk_main.cpp, once the device is made: dev.coop_matrix says the extension and its feature are on)
 namespace {
 /// Without cooperative matrices (a GTX 1650, an RTX 2060 on some drivers, AMD and Intel cards): the same multiplies in a shader function on
@@ -337,6 +441,74 @@ void software_multiplies(const char* why) {
     Shader::Backend::SPIRV::mma_software = true;
     dev.native_mma = true;
     logf("vk: matrix multiplies in software (%s)", why);
+}
+} // namespace
+
+namespace {
+// (tameem) The device lacks the console's 16x8x16 shape: its 16x16x16 one, if it has it, with the console's multiply checked on it
+// (both subgroups of a 64-lane workgroup, small integers: exact). RX_VK_MMA16=0: the software function stays
+void mma16_init(const std::vector<VkCooperativeMatrixPropertiesKHR>& props) {
+    std::string offered;
+    bool acc16 = false, acc32 = false;
+    for (const auto& p : props) {
+        char one[96];
+        snprintf(one, sizeof one, " %ux%ux%u(%d,%d,%d,%d s%d)", p.MSize, p.NSize, p.KSize, (int)p.AType, (int)p.BType, (int)p.CType,
+                 (int)p.ResultType, (int)p.scope);
+        offered += one;
+        if (p.MSize != 16 || p.NSize != 16 || p.KSize != 16 || p.scope != VK_SCOPE_SUBGROUP_KHR || p.AType != VK_COMPONENT_TYPE_FLOAT16_KHR ||
+            p.BType != VK_COMPONENT_TYPE_FLOAT16_KHR)
+            continue;
+        acc16 |= p.CType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR;
+        acc32 |= p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR;
+    }
+    logf("vk: cooperative matrices offered (M x N x K, A B C result types, scope):%s", offered.c_str());
+    if (const char* e = std::getenv("RX_VK_MMA16"); e && !std::atoi(e)) return void(logf("vk: 16x16x16 matrix multiplies off (RX_VK_MMA16=0)"));
+    if (!acc16 && !acc32) return void(logf("vk: no 16x16x16 f16 cooperative matrices either: the networks' multiplies stay in software"));
+    if (!dev.vk12.shaderFloat16 || !(dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT))
+        return void(logf("vk: 16x16x16 matrix multiplies need f16 shaders and 32-lane compute: they stay in software"));
+    const auto pack = [](float lo, float hi) { return (uint32_t)to_half(lo) | ((uint32_t)to_half(hi) << 16); };
+    const auto run = [&](bool f32_sums) {
+        std::vector<uint32_t> data(640, 0xffffffffu);
+        for (int lane = 0; lane < 64; lane++) {
+            const int t = lane % 32, s = lane / 32;   // (subgroup 1's matrices: each value one more)
+            int r0, c0, r1, c1;
+            uint32_t* w = &data[lane * 8];
+            for (int e = 0; e < 8; e += 2) console_a(t, e, r0, c0), console_a(t, e + 1, r1, c1), w[e / 2] = pack(a_val(r0, c0) + s, a_val(r1, c1) + s);
+            for (int e = 0; e < 4; e += 2) console_b(t, e, r0, c0), console_b(t, e + 1, r1, c1), w[4 + e / 2] = pack(b_val(r0, c0), b_val(r1, c1));
+            for (int e = 0; e < 4; e += 2) console_c(t, e, r0, c0), console_c(t, e + 1, r1, c1), w[6 + e / 2] = pack(c_val(r0, c0) - s, c_val(r1, c1) - s);
+        }
+        const std::vector<uint32_t> plain = mma16_test_module();
+        std::vector<uint32_t> code;
+        std::string why;
+        if (!mma16::patch(plain.data(), plain.size(), f32_sums, dev.props.limits.maxComputeSharedMemorySize, code, why))
+            return logf("vk: 16x16x16 matrix test: not patched (%s)", why.c_str()), false;
+        if (!run_shader(code, data)) return false;
+        int bad = 0;
+        for (int lane = 0; lane < 64; lane++)
+            for (int e = 0; e < 4; e++) {
+                const int t = lane % 32, s = lane / 32;
+                int r, n;
+                console_c(t, e, r, n);
+                float want = c_val(r, n) - s;
+                for (int k = 0; k < 16; k++) want += (a_val(r, k) + s) * b_val(k, n);
+                const uint32_t w = data[512 + lane * 2 + e / 2];
+                const float got = from_half((uint16_t)(e & 1 ? w >> 16 : w & 0xffff));
+                if (got != want && bad++ < 4)
+                    logf("vk: 16x16x16 matrix test%s: lane %d element %d (D[%d][%d]) %g, the CPU %g", f32_sums ? " (f32 sums)" : "", lane, e, r, n,
+                         got, want);
+            }
+        if (bad) logf("vk: 16x16x16 matrix test%s: %d of 256 elements differ", f32_sums ? " (f32 sums)" : "", bad);
+        return bad == 0;
+    };
+    bool ok = false;
+    if (acc16 && run(false)) ok = true, mma16_acc32 = false;
+    else if (acc32 && run(true)) ok = true, mma16_acc32 = true;
+    if (!ok) return void(logf("vk: 16x16x16 matrix multiplies failed their test: the networks' multiplies stay in software"));
+    mma16_enabled = true;
+    mma16_real_create = vkCreateShaderModule;
+    vkCreateShaderModule = mma16_create_module;   // (every module made from here on: those with the software function are patched)
+    logf("vk: the networks' matrix multiplies on the matrix units (16x16x16, %s sums, through shared memory; checked): the TAAU "
+         "network runs instead of its stand-in", mma16_acc32 ? "f32" : "f16");
 }
 } // namespace
 
@@ -369,6 +541,7 @@ void coopmat_init() {
                  p.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.scope == VK_SCOPE_SUBGROUP_KHR;
     if (!shape) {
         software_multiplies("the cooperative matrices lack 16x8x16 f16");
+        mma16_init(props);   // (tameem)
         return;
     }
     if (!dev.vk12.shaderFloat16) {

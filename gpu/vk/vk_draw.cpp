@@ -4506,12 +4506,15 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
 /// (shaders/taau_upscale.comp). The network's translation loses the blue channel, the yellow cast over every
 /// scene; with this the picture is right, without the network's temporal anti-aliasing.
 /// RX_VK_TAAU_KEYS=<program key prefixes,...> (default fd029a317a9a4b94; "-": none, the network runs)
+std::atomic<bool> taau_fallback{false};   // (tameem: its pipeline on the matrix units was not made: the stand-in after all)
 bool taau_key(uint64_t key) {
+    if (key == 0xfd029a317a9a4b94ull && taau_fallback.load(std::memory_order_relaxed)) return true;
     // (the real network where the card runs it as the console does; on the software multiplies it cost most of a frame on AMD's cards, and a
     // locked 60 with this in its place: Hookshot issue 52)
     static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS")
-                              : Shader::Backend::SPIRV::mma_software || getenv("RX_VK_NO_F16")
-                                    ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
+                              : (Shader::Backend::SPIRV::mma_software && !mma16_active()) || getenv("RX_VK_NO_F16")
+                                    ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out; tameem:
+                                                                  // on 16x16x16 matrix units, vk_mma16.h, the network runs)
     char hex[24];
     snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
     bool match = false;
@@ -5155,13 +5158,26 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             ci.flags &= ~VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
             made = guarded_compute(pcache, &ci, &p.compute_pipeline);
         }
-        if (made != VK_SUCCESS) {
+        if (made != VK_SUCCESS && mma16_active()) {   // (tameem) a network on the matrix units the driver would not take
+            if (p.key == 0xfd029a317a9a4b94ull) {
+                taau_fallback = true;   // (the TAAU network: its stand-in, below, as before)
+                logf("vk: the TAAU network's pipeline on the matrix units was not made (%d): its stand-in", (int)made);
+            } else if (const VkShaderModule original = mma16_unpatched(p.stages[0].module)) {   // (another: its software multiplies)
+                logf("vk: network %016llx on the matrix units not made (%d): its software multiplies", (unsigned long long)p.key, (int)made);
+                p.stages[0].module = original;
+                ci.stage.module = original;
+                ci.flags &= ~VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                made = guarded_compute(pcache, &ci, &p.compute_pipeline);
+            }
+        }
+        if (made != VK_SUCCESS && !(p.key == 0xfd029a317a9a4b94ull && taau_fallback.load())) {
             static std::atomic<int> told{0};
             if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)p.key, (int)made);
             p.compute_pipeline = VK_NULL_HANDLE;
             p.failed = true;
             SKIP_HERE();
         }
+        if (made != VK_SUCCESS) p.compute_pipeline = VK_NULL_HANDLE;
         {
             const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms", (unsigned long long)p.key, (long long)ms);

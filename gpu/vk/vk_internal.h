@@ -94,6 +94,8 @@ void memory_end_submission(VkCommandBuffer cmd);
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
+bool mma16_active();   // (tameem) vk_coopmat.cpp: the networks' multiplies on 16x16x16 cooperative matrices (vk_mma16.h)
+VkShaderModule mma16_unpatched(VkShaderModule module);   // (a patched module's original, made anew; none: it was not patched)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);
