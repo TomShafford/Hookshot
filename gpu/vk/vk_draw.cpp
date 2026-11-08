@@ -4650,8 +4650,8 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
 /// (shaders/taa_blend.comp): each pixel of its output mixed with where that point was in the last frame's, which is
 /// kept, then written back over the output (shaders/taa_store.comp) before the HUD is drawn onto it.
 /// Where it was: the scene depth and the camera's constants, which hold this frame's view-projection (words 12-27,
-/// rows) and the last frame's (96-111): a probe of the scene's draws (RX_VK_PROBE_UBO) found them at c3, in two
-/// buffers written in turn. They are told apart from other constants by the projection's shape (words 28-43) and
+/// rows) and the last frame's (96-111): a probe of the scene's draws (RX_VK_PROBE_UBO) found them at the shaders' c3 (the
+/// game's binding 0), in two buffers written in turn. They are told apart from other constants by the projection's shape (words 28-43) and
 /// the near and far planes (56, 57); the scene depth is the largest depth target with the camera's aspect that the
 /// draws binding them render into.
 /// RX_VK_TAA=0: off. RX_VK_TAA_BLEND=<0..1>: the share of each new frame (0.1). RX_VK_TAA_GAMMA: how far the last
@@ -4738,9 +4738,10 @@ VkPipeline make_pipeline(const uint32_t* spv, size_t bytes, const VkDescriptorSe
 void taa_note_draw(const NvnState& s, const Targets& at) {
     if (!taa::on() || !at.depth || !s.rt.depth) return;
     const uint64_t now = texture_frame_no();
-    thread_local uint64_t seen_addr[2]{}, seen_frame[2]{~0ull, ~0ull};
-    for (int stage = 0; stage < 2; stage++) {
-        const nvn_p_bind_buf& b = s.ubo[stage][3];
+    // (the shaders' c3 is the game's binding 0: NVN keeps c0-c2. The probe's "c3" was this; slot 3 held none)
+    thread_local uint64_t seen_addr[5]{}, seen_frame[5]{~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+    for (int stage = 0; stage < 5; stage++) {
+        const nvn_p_bind_buf& b = s.ubo[stage][0];
         if (!b.addr || b.size < taa::kWords * 4) continue;
         if (b.addr == seen_addr[stage] && seen_frame[stage] == now) continue;   // (once a frame and thread)
         seen_addr[stage] = b.addr, seen_frame[stage] = now;
