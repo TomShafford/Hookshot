@@ -50,60 +50,116 @@ SCENE_SCALE_FIX = """
 GPU_ALLOC_ENTRY = "void f_80522050(Ctx *__restrict A64_NOESC c) {"
 GPU_ALLOC_GAME = "static void f_80522050_game(Ctx *__restrict A64_NOESC c) {"
 GPU_ALLOC_WRAPPER = r"""
-/* (tameem) f_80522050 with its failures tried again (nx2/oot_patches.py GPU_ALLOC_ENTRY) */
+/* (tameem) f_80522050 with its failures tried again (nx2/oot_patches.py GPU_ALLOC_ENTRY). A sead heap here (vtable 0x84c172c8, the
+   heap class of these): +0x20 its name, +0x28 its memory, +0x30 its size, +0x38 its parent, vtable +0x80 its free size (ExpHeap:
+   the free list summed, main+0x834916d0). */
 void hos_log(const char *fmt, ...);
 void hos_sleep_ns(int64_t ns);
+int64_t hos_now_ns(void);
 static void f_80522050_game(Ctx *__restrict A64_NOESC c);
-static int gpu_alloc_readable(uint64_t a) { return a >= 0x80000000ULL && a < (1ULL << 39) - 64; }
-static void gpu_alloc_name(Ctx *c, uint64_t at, char *out, int n) {   /* (a guest C string, or "?") */
-    int i = 0;
-    if (gpu_alloc_readable(at))
-        for (; i < n - 1; i++) {
-            const char ch = (char)recomp_load8(c, at + i);
-            if (!ch) break;
-            out[i] = ch >= 32 && ch < 127 ? ch : '?';
-        }
-    if (!i) out[i++] = '?';
+static int gpu_alloc_readable(uint64_t a) { return a >= 0x80000000ULL && a < (1ULL << 39) - 0x100; }
+static int gpu_alloc_name(Ctx *c, uint64_t at, char *out, int n) {   /* (a guest C string: 1 if it reads as one) */
+    int i = 0, ok = gpu_alloc_readable(at);
+    for (; ok && i < n - 1; i++) {
+        const char ch = (char)recomp_load8(c, at + i);
+        if (!ch) break;
+        if (ch < 32 || ch >= 127) ok = 0;
+        out[i] = ch;
+    }
+    if (!ok || i < 2) i = 0, out[i++] = '?', ok = 0;
     out[i] = 0;
+    return ok;
+}
+static uint64_t gpu_alloc_free_size(Ctx *c, uint64_t heap) {   /* (the heap's own getFreeSize, called as the game would; ~0: unknown) */
+    if (!gpu_alloc_readable(heap)) return ~0ULL;
+    const uint64_t vt = recomp_load64(c, heap);
+    if (!gpu_alloc_readable(vt)) return ~0ULL;
+    A64Fn fn = a64_lookup(recomp_load64(c, vt + 0x80));
+    if (!fn) return ~0ULL;
+    uint64_t x[31];
+    const uint8_t n = c->n, z = c->z, cf = c->c, v = c->v;
+    memcpy(x, c->x, sizeof x);
+    c->x[0] = heap;
+    fn(c);
+    const uint64_t r = c->x[0];
+    memcpy(c->x, x, sizeof x);
+    c->n = n, c->z = z, c->c = cf, c->v = v;
+    return r;
+}
+static void gpu_alloc_describe(Ctx *c, uint64_t heap, char *out, int n) {
+    char name[48];
+    if (!gpu_alloc_readable(heap)) { snprintf(out, n, "heap %#llx", (unsigned long long)heap); return; }
+    if (!gpu_alloc_name(c, recomp_load64(c, heap + 0x20), name, sizeof name)) gpu_alloc_name(c, recomp_load64(c, heap + 0x28), name, sizeof name);
+    const uint64_t free_size = gpu_alloc_free_size(c, heap);
+    char free_kb[32];
+    if (free_size == ~0ULL) snprintf(free_kb, sizeof free_kb, "?");
+    else snprintf(free_kb, sizeof free_kb, "%llu", (unsigned long long)(free_size >> 10));
+    snprintf(out, n, "heap %#llx \"%s\" (%llu KB, %s KB free)", (unsigned long long)heap, name,
+             (unsigned long long)(recomp_load64(c, heap + 0x30) >> 10), free_kb);
+}
+static int gpu_alloc_in(Ctx *c, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t lr, uint64_t heap, uint64_t in) {
+    recomp_store64(c, a1 + 8, in);
+    c->x[0] = a0, c->x[1] = a1, c->x[2] = a2, c->x[30] = lr;
+    f_80522050_game(c);
+    recomp_store64(c, a1 + 8, heap);
+    return (int)(c->x[0] & 1);
 }
 void f_80522050(Ctx *__restrict A64_NOESC c) {
     const uint64_t a0 = c->x[0], a1 = c->x[1], a2 = c->x[2], lr = c->x[30];
     f_80522050_game(c);
-    if (c->x[0] & 1) return;
     static int on = -1;
     if (on < 0) on = !getenv("HOS_GPU_ALLOC_RETRY") || atoi(getenv("HOS_GPU_ALLOC_RETRY")) != 0;
     if (!on || !gpu_alloc_readable(a1)) return;
     const uint64_t count = recomp_load64(c, a1), heap = recomp_load64(c, a1 + 8), what = recomp_load64(c, a1 + 0x20);
-    int waits = 0, root = 0;
-    for (; waits < 8 && !(c->x[0] & 1); waits++) {   /* (16 ms at most: a frame's frees) */
-        hos_sleep_ns(2000000);
-        c->x[0] = a0, c->x[1] = a1, c->x[2] = a2, c->x[30] = lr;
-        f_80522050_game(c);
+    char name[64], where[160];
+    if (c->x[0] & 1) {   /* (made: every 20 s, how full its heap is, to see a heap fill over a session) */
+        static volatile int64_t next_ns;
+        const int64_t now = hos_now_ns();
+        if (now >= next_ns && heap) {
+            next_ns = now + 20000000000LL;
+            const uint64_t r0 = c->x[0];
+            gpu_alloc_name(c, what, name, sizeof name);
+            gpu_alloc_describe(c, heap, where, sizeof where);
+            c->x[0] = r0;
+            hos_log("oot: GPU memory: %s, last for %s", where, name);
+        }
+        return;
     }
-    uint64_t root_heap = 0;
-    if (!(c->x[0] & 1) && heap) {   /* (sead's heap manager: [[GOT 0x84c9dff0]] + 8, f_80522050's own default) */
-        const uint64_t got = recomp_load64(c, 0x84c9dff0ULL);
-        const uint64_t mgr = gpu_alloc_readable(got) ? recomp_load64(c, got) : 0;
-        root_heap = gpu_alloc_readable(mgr) ? recomp_load64(c, mgr + 8) : 0;
-        if (root_heap && root_heap != heap) {
-            recomp_store64(c, a1 + 8, root_heap);
-            c->x[0] = a0, c->x[1] = a1, c->x[2] = a2, c->x[30] = lr;
-            f_80522050_game(c);
-            recomp_store64(c, a1 + 8, heap);
-            root = 1;
+    gpu_alloc_name(c, what, name, sizeof name);
+    gpu_alloc_describe(c, heap, where, sizeof where);
+    static volatile long told;
+    const int tell = __atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 60;
+    if (tell)
+        hos_log("oot: GPU memory for %s, %#llx bytes from %s, failed (lr %#llx)", name, (unsigned long long)(count * a2), where,
+                (unsigned long long)lr);
+    int ok = 0, waits = 0;
+    for (; waits < 3 && !ok; waits++) {   /* (frees in flight) */
+        hos_sleep_ns(2000000);
+        ok = gpu_alloc_in(c, a0, a1, a2, lr, heap, heap);
+    }
+    if (ok) {
+        if (tell) hos_log("oot: GPU memory: made after %d waits of 2 ms", waits);
+        return;
+    }
+    /* (the heaps it was made in: their parents up to the root, the free left in them after their children) */
+    uint64_t h = heap;
+    for (int up = 0; up < 8 && gpu_alloc_readable(h) && !ok; up++) {
+        const uint64_t parent = recomp_load64(c, h + 0x38);
+        if (!gpu_alloc_readable(parent) || parent == h) break;
+        h = parent;
+        const uint64_t free_size = gpu_alloc_free_size(c, h);
+        if (free_size != ~0ULL && free_size < count * a2 + 0x2000) continue;
+        ok = gpu_alloc_in(c, a0, a1, a2, lr, heap, h);
+        if (tell) {
+            gpu_alloc_describe(c, h, where, sizeof where);
+            hos_log("oot: GPU memory: %s in its parent %s", ok ? "made" : "not made either", where);
         }
     }
-    static volatile long told;
-    if (__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 40) {
-        char name[64], heap_name[64];
-        gpu_alloc_name(c, what, name, sizeof name);
-        gpu_alloc_name(c, gpu_alloc_readable(heap) ? recomp_load64(c, heap + 0x28) : 0, heap_name, sizeof heap_name);
-        hos_log("oot: GPU memory for %s, %#llx bytes from heap %#llx (%s), failed (lr %#llx): %s", name,
-                (unsigned long long)(count * a2), (unsigned long long)heap, heap_name, (unsigned long long)lr,
-                (c->x[0] & 1) ? (root ? "made in the root heap" : "made after a wait") : "failed again: the game goes on without it");
-        if (root && !(c->x[0] & 1)) hos_log("oot: GPU memory: the root heap %#llx had no room either", (unsigned long long)root_heap);
-        if (!root && (c->x[0] & 1)) hos_log("oot: GPU memory: made after %d waits of 2 ms", waits);
+    if (!ok) {   /* (the game's own default when no heap is named: the thread's heap, or the root) */
+        ok = gpu_alloc_in(c, a0, a1, a2, lr, heap, 0);
+        if (tell) hos_log("oot: GPU memory: %s in the game's default heap", ok ? "made" : "not made either");
     }
+    if (!ok && tell) hos_log("oot: GPU memory: no heap had room: the game goes on without it (and crashes writing to it)");
 }
 """
 
@@ -117,7 +173,7 @@ def apply_gpu_alloc_retry(source):
     if source.count(header) != 1:
         raise ValueError("Expected exactly one guest header")
     source = source.replace(GPU_ALLOC_ENTRY, GPU_ALLOC_GAME, 1)   # (first: the wrapper below has the same opening line)
-    return source.replace(header, header + '#include <stdlib.h>\n' + GPU_ALLOC_WRAPPER, 1)
+    return source.replace(header, header + '#include <stdlib.h>\n#include <stdio.h>\n#include <string.h>\n' + GPU_ALLOC_WRAPPER, 1)
 
 
 def apply_scene_scale_fix(source):
