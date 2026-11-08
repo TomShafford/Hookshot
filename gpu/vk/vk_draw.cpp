@@ -22,6 +22,8 @@
 #include <map>
 #include <vector>
 #include <thread>
+#include <array>
+#include <cmath>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
@@ -38,6 +40,8 @@
 #include "shaders/clear_u_frag_spv.h"
 #include "shaders/clear_vert_spv.h"
 #include "shaders/taau_upscale_comp_spv.h"
+#include "shaders/taa_blend_comp_spv.h"
+#include "shaders/taa_store_comp_spv.h"
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
@@ -3858,6 +3862,11 @@ uint32_t mesh_args_take(uint32_t n) {   // (n entries of the ring, never entry 0
     return at + 1;
 }
 
+namespace {   // (tameem) frame blending: below, after the TAAU stand-in
+void taa_note_draw(const NvnState& s, const Targets& at);
+void taa_after_network(VkCommandBuffer cmd, const NvnState& s, const Program& p);
+}  // namespace
+
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF(PROF_DRAW);
     stats_tick();
@@ -3973,6 +3982,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
     cur_program = &p;
+    taa_note_draw(s, at);   // (tameem: the camera's constants and the scene depth, for frame blending)
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is
@@ -4636,6 +4646,358 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     return true;
 }
 
+/// (tameem) Frame blending after OoT's upscaling network (fd029a317a9a4b94), against the shimmer of grass and wheat
+/// (shaders/taa_blend.comp): each pixel of its output mixed with where that point was in the last frame's, which is
+/// kept, then written back over the output (shaders/taa_store.comp) before the HUD is drawn onto it.
+/// Where it was: the scene depth and the camera's constants, which hold this frame's view-projection (words 12-27,
+/// rows) and the last frame's (96-111): a probe of the scene's draws (RX_VK_PROBE_UBO) found them at c3, in two
+/// buffers written in turn. They are told apart from other constants by the projection's shape (words 28-43) and
+/// the near and far planes (56, 57); the scene depth is the largest depth target with the camera's aspect that the
+/// draws binding them render into.
+/// RX_VK_TAA=0: off. RX_VK_TAA_BLEND=<0..1>: the share of each new frame (0.1). RX_VK_TAA_GAMMA: how far the last
+/// frame's colour may stray from this frame's neighbours, in standard deviations (1.0). RX_VK_TAA_FLIP=0: image rows
+/// counted from the bottom. RX_VK_TAA_SHOW=1: the motion as colour (red, green: across, down; blue: none found).
+/// F10: off and on as it runs.
+namespace {
+namespace taa {
+std::mutex mu;
+struct Seen { uint64_t addr, frame; };
+std::vector<Seen> cams;                       // (the camera blocks the scene's draws bound, and when)
+std::unordered_map<uint64_t, bool> checked;   // (the constant buffers looked at: a camera block or not)
+nvn_tex depth{};                              // (the scene's depth target)
+uint64_t depth_area = 0, depth_frame = 0;
+bool off = false;                             // (F10)
+constexpr uint32_t kWords = 112;
+bool on() {
+    static const bool v = !getenv("RX_VK_TAA") || atoi(getenv("RX_VK_TAA")) != 0;
+    return v;
+}
+float wf(const uint32_t* w, int i) {
+    float v;
+    std::memcpy(&v, &w[i], 4);
+    return v;
+}
+bool is_camera(const uint32_t* w) {
+    for (const int i : {29, 30, 31, 32, 34, 35, 36, 37, 40, 41, 43})
+        if (wf(w, i) != 0.0f) return false;
+    if (wf(w, 42) != -1.0f || !(wf(w, 28) > 0.0f) || !(wf(w, 33) > 0.0f)) return false;
+    if (!(wf(w, 56) > 0.0f) || !(wf(w, 57) > wf(w, 56))) return false;
+    for (int i = 12; i < 28; i++)
+        if (!std::isfinite(wf(w, i)) || !std::isfinite(wf(w, i + 84))) return false;
+    return true;
+}
+bool invert(const double m[4][4], double out[4][4]) {
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r][c] : (c - 4 == r ? 1.0 : 0.0);
+    for (int c = 0; c < 4; c++) {
+        int piv = c;
+        for (int r = c + 1; r < 4; r++)
+            if (std::fabs(a[r][c]) > std::fabs(a[piv][c])) piv = r;
+        if (std::fabs(a[piv][c]) < 1e-12) return false;
+        if (piv != c)
+            for (int k = 0; k < 8; k++) std::swap(a[c][k], a[piv][k]);
+        const double d = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++)
+            if (r != c) {
+                const double f = a[r][c];
+                for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+            }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) out[r][c] = a[r][c + 4];
+    return true;
+}
+VkPipeline make_pipeline(const uint32_t* spv, size_t bytes, const VkDescriptorSetLayoutBinding* b, uint32_t nb, uint32_t push,
+                         VkPipelineLayout& layout) {
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    li.bindingCount = nb, li.pBindings = b;
+    VkDescriptorSetLayout set{};
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = bytes, mi.pCode = spv;
+    VkShaderModule m{};
+    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = layout;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    vkDestroyShaderModule(dev.device, m, nullptr);
+    return pipe;
+}
+}  // namespace taa
+
+/// (from draw) the camera's constants, when this draw binds them at c3, and the depth target it renders into
+void taa_note_draw(const NvnState& s, const Targets& at) {
+    if (!taa::on() || !at.depth || !s.rt.depth) return;
+    const uint64_t now = texture_frame_no();
+    thread_local uint64_t seen_addr[2]{}, seen_frame[2]{~0ull, ~0ull};
+    for (int stage = 0; stage < 2; stage++) {
+        const nvn_p_bind_buf& b = s.ubo[stage][3];
+        if (!b.addr || b.size < taa::kWords * 4) continue;
+        if (b.addr == seen_addr[stage] && seen_frame[stage] == now) continue;   // (once a frame and thread)
+        seen_addr[stage] = b.addr, seen_frame[stage] = now;
+        uint32_t w[taa::kWords];
+        std::lock_guard lk(taa::mu);
+        auto it = taa::checked.find(b.addr);
+        if (it == taa::checked.end()) {
+            if (taa::checked.size() > 4096) taa::checked.clear();
+            const bool cam = ub_read(b.addr, w, sizeof w) && taa::is_camera(w);
+            it = taa::checked.emplace(b.addr, cam).first;
+            if (cam && taa::cams.size() < 8)
+                logf("vk: frame blending: the camera's constants at %#llx (near %g, far %g)", (unsigned long long)b.addr,
+                     taa::wf(w, 56), taa::wf(w, 57));
+        }
+        if (!it->second) continue;
+        bool known = false;
+        for (taa::Seen& c : taa::cams)
+            if (c.addr == b.addr) c.frame = now, known = true;
+        if (!known && taa::cams.size() < 8) taa::cams.push_back({b.addr, now});
+        // (the scene's depth: the camera's aspect, so not a shadow map; the largest, so not a half-size pass's)
+        const Texture* d = at.depth;
+        if (!d->height || !ub_read(b.addr, w, sizeof w)) continue;
+        const double aspect = (double)d->width / d->height, want = (double)taa::wf(w, 33) / taa::wf(w, 28);
+        if (std::fabs(aspect - want) > 0.02 * want) continue;
+        const uint64_t area = (uint64_t)d->width * d->height;
+        if (area > taa::depth_area || now > taa::depth_frame + 120 ||
+            (area == taa::depth_area && std::memcmp(&taa::depth, s.rt.depth, sizeof taa::depth))) {
+            if (area != taa::depth_area) logf("vk: frame blending: the scene depth is %ux%u (format %d)", d->width, d->height, (int)d->format);
+            taa::depth = *s.rt.depth, taa::depth_area = area;
+        }
+        if (area == taa::depth_area) taa::depth_frame = now;
+    }
+}
+
+/// (from dispatch, after the network's) the blending pass over its output
+void taa_after_network(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    if (p.key != 0xfd029a317a9a4b94ull || !taa::on() || p.stages.empty() || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR)
+        return;
+    static uint64_t hist_frame = 0;   // (the frame the history was last written in: 0, none)
+#ifdef _WIN32
+    {
+        static bool was;
+        const bool down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (down && !was) {
+            taa::off = !taa::off;
+            logf("vk: F10: frame blending %s", taa::off ? "off" : "on");
+        }
+        was = down;
+    }
+#endif
+    if (taa::off) return void(hist_frame = 0);
+    const uint64_t now = texture_frame_no();
+    ParLock plk;
+    // (its output: the largest image it writes, R11G11B10)
+    const Stage& st = p.stages[0];
+    Texture* out = nullptr;
+    VkImageView out_view = VK_NULL_HANDLE;
+    uint32_t level = 0;
+    for (const auto& d : st.info.image_descriptors) {
+        if (!d.is_written) continue;
+        for (uint32_t k = 0; k < d.count; k++) {
+            const uint32_t h = handle_of(s, st, d, k);
+            Texture* t = nullptr;
+            uint32_t lv = 0;
+            const VkImageView v =
+                h ? texture_view_of(h, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &t, &lv) : VK_NULL_HANDLE;
+            if (!v || !t || t->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) continue;
+            const uint64_t area = (uint64_t)(t->width >> lv) * (t->height >> lv);
+            if (!out || area > (uint64_t)(out->width >> level) * (out->height >> level)) out = t, out_view = v, level = lv;
+        }
+    }
+    static int logged_out;
+    if (!out) {
+        if (!logged_out++) logf("vk: frame blending: the network writes no R11G11B10 image: left out");
+        return void(hist_frame = 0);
+    }
+    const uint32_t width = std::max(1u, out->width >> level), height = std::max(1u, out->height >> level);
+    // (the camera: of the blocks bound in the last frames, the newest. The two buffers are written in turn: the
+    // newer holds the older's matrix as its last frame's)
+    std::vector<std::array<uint32_t, taa::kWords>> blk;
+    nvn_tex depth_tex{};
+    bool have_depth = false;
+    {
+        std::lock_guard lk(taa::mu);
+        for (const taa::Seen& c : taa::cams) {
+            if (c.frame + 2 < now) continue;
+            std::array<uint32_t, taa::kWords> w;
+            if (ub_read(c.addr, w.data(), sizeof w) && taa::is_camera(w.data())) blk.push_back(w);
+        }
+        have_depth = taa::depth_area && taa::depth_frame + 2 >= now;
+        depth_tex = taa::depth;
+    }
+    const uint32_t* cam = nullptr;
+    for (size_t i = 0; i < blk.size() && !cam; i++) {
+        bool older = false;
+        for (size_t j = 0; j < blk.size() && !older; j++)
+            older = j != i && !std::memcmp(&blk[j][96], &blk[i][12], 64) && std::memcmp(&blk[j][12], &blk[i][12], 64);
+        if (!older) cam = blk[i].data();
+    }
+    static int logged_cam;
+    if (!cam || !have_depth) {
+        if (logged_cam++ < 3) logf("vk: frame blending: %s not found this frame: left out", !cam ? "the camera" : "the scene depth");
+        return void(hist_frame = 0);
+    }
+    Texture* dtex = texture_get(&depth_tex, false);
+    VkImageView dview = VK_NULL_HANDLE;
+    if (dtex && (dtex->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && dtex->gpu_written)
+        dview = texture_view(dtex, &depth_tex, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
+    if (!dview) {
+        if (logged_cam++ < 3) logf("vk: frame blending: the scene depth has no view: left out");
+        return void(hist_frame = 0);
+    }
+    // (u, v, depth, 1) of this frame -> (u w, v w, w) of the last: S * last VP * VP^-1 * T, in doubles
+    static const bool flip = !getenv("RX_VK_TAA_FLIP") || atoi(getenv("RX_VK_TAA_FLIP")) != 0;
+    const bool minus_w = host->depth_minus_w() != 0;
+    double vp[4][4], last[4][4], inv[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) vp[r][c] = taa::wf(cam, 12 + 4 * r + c), last[r][c] = taa::wf(cam, 96 + 4 * r + c);
+    if (!taa::invert(vp, inv)) return void(hist_frame = 0);
+    const double za = minus_w ? 2.0 : 1.0, zb = minus_w ? -1.0 : 0.0;
+    const double T[4][4] = {{2, 0, 0, -1}, {0, flip ? -2.0 : 2.0, 0, flip ? 1.0 : -1.0}, {0, 0, za, zb}, {0, 0, 0, 1}};
+    const double S[3][4] = {{0.5, 0, 0, 0.5}, {0, flip ? -0.5 : 0.5, 0, 0.5}, {0, 0, 0, 1}};
+    double a[4][4]{}, b[4][4]{}, m[3][4]{};
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++) a[r][c] += inv[r][k] * T[k][c];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++) b[r][c] += last[r][k] * a[k][c];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++) m[r][c] += S[r][k] * b[k][c];
+    // (which way depth runs: a point 1 and 100 units ahead, through the projection, words 28-43)
+    const auto stored = [&](double dist) {
+        const double z = taa::wf(cam, 38) * -dist + taa::wf(cam, 39), w = taa::wf(cam, 42) * -dist + taa::wf(cam, 43);
+        return (z / w - zb) / za;
+    };
+    struct {
+        float r0[4], r1[4], r3[4];
+        int32_t size[2];
+        float alpha, gamma;
+        uint32_t flags;
+    } pc{};
+    for (int c = 0; c < 4; c++) pc.r0[c] = (float)m[0][c], pc.r1[c] = (float)m[1][c], pc.r3[c] = (float)m[2][c];
+    pc.size[0] = (int32_t)width, pc.size[1] = (int32_t)height;
+    static const float alpha = getenv("RX_VK_TAA_BLEND") ? std::clamp((float)atof(getenv("RX_VK_TAA_BLEND")), 0.01f, 1.0f) : 0.1f;
+    static const float gamma = getenv("RX_VK_TAA_GAMMA") ? std::max(0.1f, (float)atof(getenv("RX_VK_TAA_GAMMA"))) : 1.0f;
+    static const bool show = getenv("RX_VK_TAA_SHOW") != nullptr;
+    pc.alpha = alpha, pc.gamma = gamma;
+    pc.flags = (!std::memcmp(cam + 12, cam + 96, 64) ? 2u : 0u) | (stored(100.0) < stored(1.0) ? 4u : 0u) | (show ? 8u : 0u);
+    // (the pipelines, once)
+    static VkPipeline blend = VK_NULL_HANDLE, store = VK_NULL_HANDLE;
+    static VkPipelineLayout blend_layout = VK_NULL_HANDLE, store_layout = VK_NULL_HANDLE;
+    static VkSampler linear = VK_NULL_HANDLE, nearest = VK_NULL_HANDLE;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const VkDescriptorSetLayoutBinding bb[4] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                    {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                    {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        const VkDescriptorSetLayoutBinding sb[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        blend = taa::make_pipeline(TAA_BLEND_COMP_SPV, sizeof TAA_BLEND_COMP_SPV, bb, 4, sizeof pc, blend_layout);
+        store = taa::make_pipeline(TAA_STORE_COMP_SPV, sizeof TAA_STORE_COMP_SPV, sb, 2, 8, store_layout);
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 0.25f;
+        vkCreateSampler(dev.device, &si, nullptr, &linear);
+        si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+        vkCreateSampler(dev.device, &si, nullptr, &nearest);
+        logf("vk: frame blending after the upscaling network%s: output %ux%u, depth %ux%u, depth %s, rows from the %s; share of each "
+             "frame %.2f, gamma %.2f; F10 turns it off and on",
+             blend && store && linear && nearest ? "" : ": its pipelines were not made, left out", width, height, dtex->width, dtex->height,
+             minus_w ? "-1..1" : "0..1", flip ? "top" : "bottom", alpha, gamma);
+    }
+    if (!blend || !store || !linear || !nearest) return;
+    // (the history: two images in turn, this frame's output and the last)
+    static VkImage hist[2]{};
+    static VmaAllocation hist_mem[2]{};
+    static VkImageView hist_view[2]{};
+    static uint32_t hist_w = 0, hist_h = 0, which = 0;
+    if (hist_w != width || hist_h != height) {
+        // (the ones before are kept: work in flight may still use them, and the output's size seldom changes)
+        for (int i = 0; i < 2; i++) {
+            VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            ic.extent = {width, height, 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+            ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            if (!create_image(ic, hist[i], hist_mem[i])) {
+                hist_w = hist_h = 0;
+                return;
+            }
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = hist[i], vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCreateImageView(dev.device, &vc, nullptr, &hist_view[i]);
+            VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+            ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+            ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ib.image = hist[i], ib.subresourceRange = vc.subresourceRange;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+            vkCmdPipelineBarrier2(cmd, &di);
+        }
+        hist_w = width, hist_h = height, hist_frame = 0;
+    }
+    // (last frame's, or the one before: a pause of the network, a menu, starts again from this frame alone)
+    if (hist_frame && now - hist_frame <= 2) pc.flags |= 1u;
+    hist_frame = now;
+    const uint32_t prev = which, next = which ^ 1u;
+    which = next;
+    full_barrier(cmd);   // (the network's writes)
+    {
+        const VkDescriptorImageInfo i0{VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo i1{linear, hist_view[prev], VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo i2{nearest, dview, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo i3{VK_NULL_HANDLE, hist_view[next], VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo* infos[4] = {&i0, &i1, &i2, &i3};
+        VkWriteDescriptorSet w[4]{};
+        for (uint32_t i = 0; i < 4; i++) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+            w[i].descriptorType = i == 1 || i == 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[i].pImageInfo = infos[i];
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, blend);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, blend_layout, 0, 4, w);
+        vkCmdPushConstants(cmd, blend_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    }
+    full_barrier(cmd);
+    {
+        const VkDescriptorImageInfo i0{VK_NULL_HANDLE, hist_view[next], VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo i1{VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2]{};
+        for (uint32_t i = 0; i < 2; i++) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, w[i].dstBinding = i, w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[i].pImageInfo = i ? &i1 : &i0;
+        }
+        const int32_t size[2] = {(int32_t)width, (int32_t)height};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, store);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, store_layout, 0, 2, w);
+        vkCmdPushConstants(cmd, store_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, size);
+        vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    }
+    full_barrier(cmd);   // (what draws onto it next)
+    descriptors_disturbed();
+    static int logged_on;
+    if (!logged_on++)
+        logf("vk: frame blending: running (camera %s, depth runs %s)", pc.flags & 2u ? "still" : "moving", pc.flags & 4u ? "far to near" : "near to far");
+}
+}  // namespace
+
 bool precompile_wanted() {
 #if defined(HOOKSHOT_RELEASE)
     bool on = true;
@@ -5236,7 +5598,10 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             logf("%s", line);
         }
     }
-    if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
+    if (taau_stand_in(cmd, s, p)) {
+        taa_after_network(cmd, s, p);   // (tameem)
+        return void(st_dispatches++);
+    }
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.compute_pipeline);
@@ -5295,6 +5660,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             vkCmdDispatch(cmd, x, y, z);
         }
     }
+    taa_after_network(cmd, s, p);   // (tameem: frame blending over the upscaling network's output)
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
     if (gprof_on()) {
         char label[96];

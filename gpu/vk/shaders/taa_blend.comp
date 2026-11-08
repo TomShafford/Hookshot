@@ -1,0 +1,113 @@
+#version 450
+// (tameem) Frame blending after OoT's upscaling network (vk_draw.cpp taa_after_network), against the shimmer of thin
+// things (grass, fences, wheat): each output pixel mixed with where that point of the scene was in the last frame's
+// output. The game has no camera jitter and no motion vectors, so where it was comes from the scene depth and the
+// camera's matrices: pc.r0, r1, r3 take (u, v, depth, 1) of this frame to (u, v, 1) times w of the last frame
+// (the CPU folds this frame's inverse and last frame's view-projection, the depth mode and the rows' direction
+// into them).
+//
+// Last frame's colour is held to this frame's 3x3 neighbourhood (a box in YCoCg, mean +- gamma standard deviations
+// within its min and max: clipped toward its centre), so what newly shows or moves on its own (Link, swaying grass)
+// takes this frame's colour instead of leaving a trail. All of it in a tone-mapped space, so one bright pixel neither
+// widens the box nor outweighs the rest. pc.alpha: the share of this frame each frame (0.1: about ten frames' worth).
+//
+// flags: 1 last frame's output is there; 2 the camera did not move (last frame's pixel itself); 4 the nearest depth
+// is the largest (a reversed depth); 8 the motion shown as colour (RX_VK_TAA_SHOW)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, r11f_g11f_b10f) uniform readonly image2D cur;
+layout(binding = 1) uniform sampler2D hist;
+layout(binding = 2) uniform sampler2D depth;
+layout(binding = 3, rgba16f) uniform writeonly image2D outp;
+layout(push_constant) uniform P {
+    vec4 r0, r1, r3;
+    ivec2 size;
+    float alpha, gamma;
+    uint flags;
+} pc;
+
+vec3 tonemap(vec3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+vec3 untonemap(vec3 c) { return c / max(1.0 / 65504.0, 1.0 - max(c.r, max(c.g, c.b))); }
+vec3 to_ycocg(vec3 c) {
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)), dot(c, vec3(0.5, 0.0, -0.5)), dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+vec3 from_ycocg(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+vec3 load_cur(ivec2 p) {
+    vec3 c = imageLoad(cur, clamp(p, ivec2(0), pc.size - 1)).rgb;
+    if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
+    return to_ycocg(tonemap(max(c, vec3(0.0))));
+}
+// last frame's output at uv, Catmull-Rom from five bilinear taps (a bilinear tap alone softens the picture a little
+// more each frame the camera moves)
+vec3 hist_at(vec2 uv) {
+    const vec2 sz = vec2(textureSize(hist, 0));
+    const vec2 pos = uv * sz;
+    const vec2 c1 = floor(pos - 0.5) + 0.5;
+    const vec2 f = pos - c1;
+    const vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    const vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    const vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    const vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    const vec2 w12 = w1 + w2;
+    const vec2 t12 = (c1 + w2 / w12) / sz, t0 = (c1 - 1.0) / sz, t3 = (c1 + 2.0) / sz;
+    const float a = w12.x * w0.y, b = w0.x * w12.y, c = w12.x * w12.y, d = w3.x * w12.y, e = w12.x * w3.y;
+    const vec3 r = textureLod(hist, vec2(t12.x, t0.y), 0.0).rgb * a + textureLod(hist, vec2(t0.x, t12.y), 0.0).rgb * b +
+                   textureLod(hist, t12, 0.0).rgb * c + textureLod(hist, vec2(t3.x, t12.y), 0.0).rgb * d +
+                   textureLod(hist, vec2(t12.x, t3.y), 0.0).rgb * e;
+    return max(r / (a + b + c + d + e), vec3(0.0));
+}
+vec3 clip_box(vec3 lo, vec3 hi, vec3 h) {
+    const vec3 mid = 0.5 * (hi + lo), ext = 0.5 * (hi - lo) + 1e-5;
+    const vec3 v = h - mid;
+    const vec3 a = abs(v / ext);
+    const float m = max(a.x, max(a.y, a.z));
+    return m > 1.0 ? mid + v / m : h;
+}
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const vec2 uv = (vec2(g) + 0.5) / vec2(pc.size);
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9), mid = vec3(0.0);
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            const vec3 c = load_cur(g + ivec2(x, y));
+            m1 += c, m2 += c * c, lo = min(lo, c), hi = max(hi, c);
+            if (x == 0 && y == 0) mid = c;
+        }
+    vec3 res = mid;
+    vec2 prev = uv;
+    bool ok = (pc.flags & 1u) != 0u;
+    if (ok && (pc.flags & 2u) == 0u) {
+        // the nearest of the 3x3 depths around it: an edge moves with what is in front
+        const ivec2 dsz = textureSize(depth, 0);
+        const ivec2 dp = ivec2(uv * vec2(dsz));
+        const bool rev = (pc.flags & 4u) != 0u;
+        float best = rev ? -1.0 : 2.0;
+        ivec2 at = dp;
+        for (int y = -1; y <= 1; y++)
+            for (int x = -1; x <= 1; x++) {
+                const ivec2 q = clamp(dp + ivec2(x, y), ivec2(0), dsz - 1);
+                const float d = texelFetch(depth, q, 0).r;
+                if (rev ? d > best : d < best) best = d, at = q;
+            }
+        const vec2 uvd = (vec2(at) + 0.5) / vec2(dsz);
+        const vec4 p = vec4(uvd, clamp(best, 0.0, 1.0), 1.0);
+        const float w = dot(pc.r3, p);
+        if (w > 1e-7) prev = uv + vec2(dot(pc.r0, p), dot(pc.r1, p)) / w - uvd;
+        else ok = false;
+    }
+    ok = ok && all(greaterThanEqual(prev, vec2(0.0))) && all(lessThanEqual(prev, vec2(1.0)));
+    if (ok) {
+        vec3 h = (pc.flags & 2u) != 0u ? texelFetch(hist, g, 0).rgb : hist_at(prev);
+        if (any(isnan(h)) || any(isinf(h))) h = vec3(0.0);
+        h = to_ycocg(tonemap(h));
+        const vec3 mu = m1 / 9.0, sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
+        h = clip_box(max(lo, mu - pc.gamma * sigma), min(hi, mu + pc.gamma * sigma), h);
+        res = mix(h, mid, pc.alpha);
+    }
+    vec3 rgb = max(untonemap(max(from_ycocg(res), vec3(0.0))), vec3(0.0));
+    if ((pc.flags & 8u) != 0u) {
+        const vec2 mv = (prev - uv) * vec2(pc.size);
+        rgb = ok ? vec3(abs(mv) * 0.05, 0.0) : vec3(0.0, 0.0, 0.5);
+    }
+    imageStore(outp, g, vec4(rgb, 1.0));
+}

@@ -1,0 +1,12 @@
+#version 450
+// (tameem) The blended frame (shaders/taa_blend.comp, kept as the next frame's history) written over the upscaling
+// network's output, which the HUD and the frame's last passes draw onto after
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform readonly image2D src;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; } pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    imageStore(dst, g, vec4(imageLoad(src, g).rgb, 1.0));
+}
