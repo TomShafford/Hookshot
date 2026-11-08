@@ -61,6 +61,9 @@ VmaPool images_pool() {
     return image_pool;
 }
 
+std::atomic<uint64_t> out_of_vram{0};
+uint64_t images_out_of_vram() { return out_of_vram.load(); }
+
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -78,6 +81,7 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     // (hookshot) VRAM is full (a 4 GB card at a high resolution, #96): an image left unmade is a black screen, so it goes
     // to system memory instead, slow but drawn
+    out_of_vram++;   // (tameem: the texture budget's squeeze stops counting the blocks' free space as room, vk_texture.cpp)
     if (getenv("RX_VK_IMAGES_VRAM_ONLY")) return false;
     VmaAllocationCreateInfo sai{};
     sai.usage = VMA_MEMORY_USAGE_AUTO;

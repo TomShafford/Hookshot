@@ -196,6 +196,8 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);
 void vma_log_heaps();
+/// (tameem) Images made in system memory so far because neither VMA's image pool nor a block of their own fit in VRAM (create_image)
+uint64_t images_out_of_vram();
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);

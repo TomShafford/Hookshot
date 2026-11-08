@@ -2607,8 +2607,27 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = pressure - allowed / 10 * 9;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
+    // (tameem) less what the blocks already hold free: a texture evicted frees space inside a block, and the driver's count only falls
+    // when a whole block goes, so with that much free the squeeze could not bring it down. On a 16 GB card whose allowance fell to
+    // 11.5 GB (3.5 GB of it outside the blocks from the start: the shader libraries, the driver's own) the count sat at the limit with 2-4 GB free in the blocks, the budget at 2-3 GB,
+    // below what the last 8 presents used: 188000 textures evicted and made again in one session, those the GPU draws among them
+    // (Hyrule Field's path a criss-cross pattern beyond the near ground, as issue 386). Once the blocks are full the pressure rule
+    // above evicts again; and so does this one when an image went to system memory since the last look (the free space too scattered
+    // for it). RX_VK_SQUEEZE_IGNORES_FREE=1: as before
+    static const bool squeeze_ignores_free = getenv("RX_VK_SQUEEZE_IGNORES_FREE") != nullptr;
+    static uint64_t out_of_vram_seen = 0;
+    const uint64_t out_of_vram_now = images_out_of_vram();
+    const bool free_unusable = out_of_vram_now != out_of_vram_seen;
+    out_of_vram_seen = out_of_vram_now;
     if (known && !by_blocks && used > allowed / 100 * 97) {
-        const uint64_t over = used - allowed / 100 * 97;
+        uint64_t over = used - allowed / 100 * 97;
+        if (!squeeze_ignores_free && !free_unusable) {
+            static uint64_t told = 0;
+            if (block_free >= over && told++ % 600 == 0)
+                logf("vk: VRAM: the driver's count %llu MB over 97%% of what it allows, %llu MB free in the blocks: no texture evicted for it",
+                     (unsigned long long)(over >> 20), (unsigned long long)(block_free >> 20));
+            over = over > block_free ? over - block_free : 0;
+        }
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
     if (frame_no % 600 == 0) {
