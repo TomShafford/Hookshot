@@ -78,20 +78,39 @@ void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR:
 }
 } // Anonymous namespace
 
-void EmitLoadGlobalU8(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+// (tameem) The 8- and 16-bit loads through an address no storage buffer was found for: the word that holds them, through the
+// 32-bit load (a bound buffer's range, else the page table where the stage follows pointers), and their bits from it. They threw,
+// and the whole program was left out: OoT's near foliage (the mesh programs of the wheat in Hyrule Field) was never drawn
+namespace {
+Id LoadGlobalSubword(EmitContext& ctx, Id address, u32 bits, bool is_signed) {
+    if (!ctx.profile.support_int64) {
+        LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
+        return ctx.Const(0u);
+    }
+    const Id low{ctx.OpUConvert(ctx.U32[1], address)};
+    const Id byte{ctx.OpBitwiseAnd(ctx.U32[1], low, ctx.Const(3u))};
+    const Id aligned{ctx.OpISub(ctx.U64, address, ctx.OpUConvert(ctx.U64, byte))};
+    const Id word{ctx.OpFunctionCall(ctx.U32[1], ctx.load_global_func_u32, aligned)};
+    const Id shift{ctx.OpShiftLeftLogical(ctx.U32[1], byte, ctx.Const(3u))};
+    return is_signed ? ctx.OpBitFieldSExtract(ctx.U32[1], word, shift, ctx.Const(bits))
+                     : ctx.OpBitFieldUExtract(ctx.U32[1], word, shift, ctx.Const(bits));
+}
+} // Anonymous namespace
+
+Id EmitLoadGlobalU8(EmitContext& ctx, Id address) {
+    return LoadGlobalSubword(ctx, address, 8, false);
 }
 
-void EmitLoadGlobalS8(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitLoadGlobalS8(EmitContext& ctx, Id address) {
+    return LoadGlobalSubword(ctx, address, 8, true);
 }
 
-void EmitLoadGlobalU16(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitLoadGlobalU16(EmitContext& ctx, Id address) {
+    return LoadGlobalSubword(ctx, address, 16, false);
 }
 
-void EmitLoadGlobalS16(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitLoadGlobalS16(EmitContext& ctx, Id address) {
+    return LoadGlobalSubword(ctx, address, 16, true);
 }
 
 Id EmitLoadGlobal32(EmitContext& ctx, Id address) {

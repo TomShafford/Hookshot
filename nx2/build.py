@@ -429,9 +429,15 @@ def main():
         # keeps them)
         stamp = hashlib.sha1()
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
+        # (tameem) gpu/vk/stamp_base/<path>: the file as the stamp takes it, for a change that only lets programs translate that
+        # threw before (nothing of theirs was ever kept: the cached programs are what the new translator makes of them too, so the
+        # caches, hours of a first start, stay)
+        base = os.path.join(vk, "stamp_base")
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
-            with open(f, "rb") as src:
-                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+            rel = os.path.relpath(f, vk)
+            pinned = os.path.join(base, rel)
+            with open(pinned if os.path.isfile(pinned) else f, "rb") as src:
+                stamp.update(rel.replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
