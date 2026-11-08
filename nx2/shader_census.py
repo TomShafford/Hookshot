@@ -6,6 +6,12 @@ Walks romfs/Shader/*.bfsha.zs (and the shader packages inside other archives), a
 are programs: which stages go together, so what comes out are real pairs, not a heap of stages. --out writes them for the back
 end to translate (gpu/vk/vk_shader.cpp); nothing here goes into the repository: the file is made from the player's own game.
 
+(tameem) Also romfs/Effect/*.vsetb* (each effect's particle shaders: its BNSH, graphics and the emitters' compute) and the engine's
+own archives (agl's BAHS .sharcb, in Lib/ and in Shader/ApplicationPackage, and its NDSR .pck, the upscaler's networks: their
+compute shaders, each a program of its own). Those
+were met only in play: a compute pipeline is built on the thread that records the dispatch, and the game stopped while the driver
+compiled it (a second or more on jumps and sword swings, the slowest a minute).
+
 After tools/shader_census.py of TotK Recomp (github.com/valentderah/totk-pc-recomp, MIT), itself after MacNativeGames'
 prepare_shader_seed.py (MIT): the BNSH layout and the walk of its variations.
 
@@ -85,13 +91,77 @@ def bnsh_programs(data, stats):
 
 
 def archives(romfs):
-    """The files that hold shaders: Shader/* (programs, and ApplicationPackage's compute), Layout2Shader/*"""
-    for folder in ("Shader", "Layout2Shader"):
+    """The files that hold shaders: Shader/* (programs, and ApplicationPackage's compute), Layout2Shader/*, Effect/* (each effect's
+    shaders), Lib/* (the engine's)"""
+    for folder, marks in (("Shader", (".bfsha", ".sarc")), ("Layout2Shader", (".bfsha", ".sarc")), ("Effect", (".vsetb",)),
+                          ("Lib", (".sarc", ".sharcb"))):
         top = os.path.join(romfs, folder)
-        if os.path.isdir(top):
-            for name in sorted(os.listdir(top)):
-                if ".bfsha" in name or ".sarc" in name:
-                    yield os.path.join(top, name)
+        for root, dirs, files in sorted(os.walk(top)):
+            dirs.sort()
+            for name in sorted(files):
+                if any(m in name for m in marks):
+                    yield os.path.join(root, name)
+
+
+def bahs_computes(data, stats):
+    """The compute shaders of a BAHS (agl's shader archive, version 11) as [(stage, control, code)]. Its header: u32 the file's
+    size at 8, the code at 0x18 (u32 offset, u32 size); before the code, the control sections and the records of the shaders: a
+    record is u64 its code (from the file's code size: at that plus the size), u32 its control's size, s32 its control (from the
+    record), and a control says how long its code is (+0x44). Its graphics shaders are left out: which go together is not known"""
+    if data[:4] != b"BAHS" or len(data) < 0x20:
+        return []
+    code_at, code_size = struct.unpack_from("<II", data, 0x18)
+    if not 0 < code_at <= len(data) or code_at + code_size > len(data):
+        stats["BAHS: no code"] += 1
+        return []
+    controls = {m.start() for m in re.finditer(re.escape(CONTROL_MAGIC), data[:code_at]) if m.start() % 4 == 0}
+    words = memoryview(data[:code_at - code_at % 4]).cast("i")
+    out = {}
+    for i in range(3, len(words)):
+        record = (i - 3) * 4
+        control_at = record + words[i]
+        if control_at == record or control_at not in controls:
+            continue
+        code_rel, high, control_size = words[i - 3] & 0xffffffff, words[i - 2], words[i - 1]
+        if high or not 0xd8 <= control_size <= 0x1000 or control_at + control_size > code_at:
+            continue
+        control = bytes(data[control_at:control_at + control_size])
+        stage = struct.unpack_from("<H", control, 0x56)[0]
+        end = struct.unpack_from("<I", control, 0x44)[0]
+        code_off = code_rel + code_size
+        if stage != 5 or code_off % 0x100 or not code_at <= code_off or code_off + end > len(data) or not end:
+            continue
+        out[(control_at, code_off)] = (stage, control, bytes(data[code_off:code_off + end]))
+    stats["BAHS compute"] += len(out)
+    return list(out.values())
+
+
+def ndsr_computes(data, stats):
+    """The compute shaders of an NDSR pack (agl's .pck: the upscaler's networks, its TAAU among them) as [(stage, control, code)]:
+    a table at the front whose entries name a control (u32 offset) and, 8 bytes on, its code (u32 offset); the controls come
+    after the code, 0xe0 bytes each. A control can be named by more than one entry (one control, more than one code)"""
+    if data[:4] != b"NDSR":
+        return []
+    controls = [m.start() for m in re.finditer(re.escape(CONTROL_MAGIC), data) if m.start() + 0xe0 <= len(data)]
+    if not controls:
+        return []
+    first = controls[0]
+    out = {}
+    for control_at in controls:
+        control = bytes(data[control_at:control_at + 0xe0])
+        stage = struct.unpack_from("<H", control, 0x56)[0]
+        end = struct.unpack_from("<I", control, 0x44)[0]
+        if stage != 5 or not end:
+            continue
+        for m in re.finditer(re.escape(struct.pack("<I", control_at)), data[:first]):
+            if m.start() + 12 > first:
+                continue
+            code_off = struct.unpack_from("<I", data, m.start() + 8)[0]
+            if code_off % 0x100 or code_off + end > first:
+                continue
+            out[(control_at, code_off)] = (stage, control, bytes(data[code_off:code_off + end]))
+    stats["NDSR compute"] += len(out)
+    return list(out.values())
 
 
 def sarc_files(data):
@@ -120,27 +190,57 @@ def main():
     dicts = dictionaries(a.romfs, zs)
     stats = collections.Counter()
     stage_index, stage_list, programs, seen = {}, [], [], set()
+    by_folder = collections.Counter()
+    quiet = 0
     for path in archives(a.romfs):
         made = 0
-        for data in blobs(unpack(open(path, "rb").read(), dicts, zs), dicts, zs):
+
+        def add(stages):
+            nonlocal made
+            ids = []
+            for stage, control, code in stages:
+                key = int.from_bytes(hashlib.sha1(control + code).digest()[:8], "little")
+                if key not in stage_index:
+                    stage_index[key] = len(stage_list)
+                    stage_list.append((key, stage, control, code))
+                ids.append(stage_index[key])
+            ids = tuple(ids)
+            if ids not in seen:
+                seen.add(ids)
+                programs.append(ids)
+                made += 1
+
+        try:
+            outer = unpack(open(path, "rb").read(), dicts, zs)
+        except (OSError, ValueError) as ex:   # (one file the archives cannot open: the rest go on)
+            stats["unreadable file"] += 1
+            print("%-64s left out: %s" % (os.path.basename(path)[:64], ex), flush=True)
+            continue
+        for data in blobs(outer, dicts, zs):
             view = memoryview(data)
             for m in re.finditer(b"BNSH", data):
                 if data[m.start() + 96:m.start() + 100] != b"grsc":
                     continue
-                for stages in bnsh_programs(bytes(view[m.start():m.start() + struct.unpack_from("<I", data, m.start() + 28)[0]]), stats):
-                    ids = []
-                    for stage, control, code in stages:
-                        key = int.from_bytes(hashlib.sha1(control + code).digest()[:8], "little")
-                        if key not in stage_index:
-                            stage_index[key] = len(stage_list)
-                            stage_list.append((key, stage, control, code))
-                        ids.append(stage_index[key])
-                    ids = tuple(ids)
-                    if ids not in seen:
-                        seen.add(ids)
-                        programs.append(ids)
-                        made += 1
-        print("%-64s %6d programs" % (os.path.basename(path)[:64], made), flush=True)
+                try:
+                    for stages in bnsh_programs(bytes(view[m.start():m.start() + struct.unpack_from("<I", data, m.start() + 28)[0]]), stats):
+                        add(stages)
+                except (ValueError, struct.error):
+                    stats["unreadable BNSH"] += 1
+            if data[:4] == b"BAHS":
+                for stage in bahs_computes(data, stats):
+                    add([stage])
+            if data[:4] == b"NDSR":
+                for stage in ndsr_computes(data, stats):
+                    add([stage])
+        folder = os.path.relpath(path, a.romfs).split(os.sep)[0]
+        by_folder[folder] += made
+        if folder != "Effect":
+            print("%-64s %6d programs" % (os.path.basename(path)[:64], made), flush=True)
+        else:   # (some 1400 of them: a line every 100)
+            quiet += 1
+            if quiet % 100 == 0:
+                print("Effect: %d files, %d programs so far" % (quiet, by_folder[folder]), flush=True)
+    print("programs by folder:", dict(by_folder))
     kinds = collections.Counter(tuple(sorted(stage_list[i][1] for i in ids)) for ids in programs)
     print("%d programs from %d stages" % (len(programs), len(stage_list)))
     print("by stages:", kinds.most_common(12))

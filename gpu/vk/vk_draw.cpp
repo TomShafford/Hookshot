@@ -520,9 +520,9 @@ void pcache_init() {
     pcache_path = dir + "mkw_vk_pipelines.bin";
     std::vector<uint8_t> data;
     if (FILE* f = fopen(pcache_path.c_str(), "rb")) {
-        fseek(f, 0, SEEK_END);
-        const long sz = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        _fseeki64(f, 0, SEEK_END);   // (tameem: past 2 GB with every compute program in it, where a long ends on Windows)
+        const int64_t sz = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
         if (sz > 32) {
             data.resize((size_t)sz);
             if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
@@ -4650,9 +4650,25 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     std::string path(exe, exe_n);
     path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepared.bin";
     const uint64_t stamp = program_cache_stamp();
+    // (tameem) and which seed: a new hookshot_shaders.bin (the census reads more of the game: effects, the engine's compute) is
+    // prepared again, though the translator is the same. Only what is new is translated: seed_program passes over what is on disk
+    uint64_t seed_sig = 0;
+    {
+        const std::string seed_file = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_shaders.bin";
+        if (FILE* f = fopen(seed_file.c_str(), "rb")) {
+            uint8_t head[16]{};
+            const size_t got = fread(head, 1, sizeof head, f);
+            _fseeki64(f, 0, SEEK_END);
+            const uint64_t size = (uint64_t)_ftelli64(f);
+            fclose(f);
+            seed_sig = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < got; i++) seed_sig = (seed_sig ^ head[i]) * 0x100000001b3ull;
+            for (int i = 0; i < 8; i++) seed_sig = (seed_sig ^ (uint8_t)(size >> (8 * i))) * 0x100000001b3ull;
+        }
+    }
     if (FILE* f = fopen(path.c_str(), "rb")) {
-        uint64_t have = 0;
-        const bool same = fread(&have, 8, 1, f) == 1 && have == stamp;
+        uint64_t have[2] = {0, 0};
+        const bool same = fread(have, 8, 2, f) == 2 && have[0] == stamp && have[1] == seed_sig;
         fclose(f);
         if (same && !getenv("RX_VK_PREPARE_AGAIN")) {
             if (getenv("RX_VK_SEED_CHECK")) seed_open();
@@ -4678,7 +4694,8 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     }
     auto blank = std::make_unique<NvnState>();
     blank->nvattr = 16;
-    std::atomic<size_t> next{0}, done{0}, made{0}, libs{0};
+    std::atomic<size_t> next{0}, done{0}, made{0}, libs{0}, compute_built{0};
+    if (warm_cs) pcache_init();
     const auto worker = [&] {
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -4700,9 +4717,13 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
                     ci.layout = p->layout;
                     if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                     VkPipeline pl = VK_NULL_HANDLE;
-                    if (guarded_compute(VK_NULL_HANDLE, &ci, &pl) == VK_SUCCESS && pl) {
+                    // (tameem) into our pipeline cache: precompile_run builds every compute program at each start, and from
+                    // the cache that is a moment where the driver's own compile was seconds (once more for each of them)
+                    if (guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
                         vkDestroyPipeline(dev.device, pl, nullptr);
                         libs++;
+                        compute_built++;
+                        pcache_built_since_save++;
                     }
                 }
                 if (!p->failed && warm && !p->compute) {
@@ -4737,7 +4758,9 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries) in %.1f s", programs, made.load(), (long long)failed,
          libs.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     remove(warming.c_str());
-    if (FILE* f = fopen(path.c_str(), "wb")) fwrite(&stamp, 8, 1, f), fclose(f);
+    if (compute_built.load()) pipeline_cache_save(false);   // (tameem: the compute pipelines, for precompile_run at every start)
+    const uint64_t done_as[2] = {stamp, seed_sig};
+    if (FILE* f = fopen(path.c_str(), "wb")) fwrite(done_as, 8, 2, f), fclose(f);
 }
 
 void precompile_run(void (*progress)(size_t done, size_t total)) {
@@ -4773,8 +4796,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     std::vector<Program*> computes;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
-        if (p.compute) computes.push_back(&p);
+        if (p.compute && !taau_key(p.key)) computes.push_back(&p);   // (tameem: a stood-in network is never compiled)
     });
+    std::atomic<size_t> compiled{0};   // (tameem: those not in the cache)
     const size_t total = notes.size() + computes.size();
     std::atomic<size_t> next{0}, done{0};
     const auto worker = [&] {
@@ -4790,7 +4814,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 ci.stage.pName = "main";
                 pin_subgroup(ci.stage, p.workgroup[0]);
                 ci.layout = p.layout;
+                const auto t1 = std::chrono::steady_clock::now();
                 if (vkCreateComputePipelines(dev.device, pcache, 1, &ci, nullptr, &p.compute_pipeline) != VK_SUCCESS) p.compute_pipeline = VK_NULL_HANDLE;
+                else if (std::chrono::steady_clock::now() - t1 > std::chrono::milliseconds(20)) compiled++, pcache_built_since_save++;
             } else {
                 PipeNote& n = *notes[i - computes.size()];
                 const Program* p = program_find(n.prog, n.variant);
@@ -4824,8 +4850,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
-    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, notes.size(), computes.size(),
-         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines (%zu compiled, not in the cache) in %.0f ms", programs_n,
+         notes.size(), computes.size(), compiled.load(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (compiled.load()) pipeline_cache_save(false);
 }
 
 // ---- (tameem) Every shader of the game before it starts. prepare_run translates each of the game's programs (all of its shader
@@ -4900,7 +4927,7 @@ void all_shaders_run(void (*progress)(size_t done, size_t total)) {
     const int64_t mem0 = private_mb();
     const int64_t cap_mb = getenv("RX_VK_ALL_SHADERS_MAX_MB") ? atoll(getenv("RX_VK_ALL_SHADERS_MAX_MB")) : 6000;
     std::atomic<bool> keep{true};
-    std::atomic<int64_t> kept{0}, compiled{0}, failed{0};
+    std::atomic<int64_t> kept{0}, compiled{0}, failed{0}, past_cap{0};
     std::atomic<size_t> seen{0};
     logf("vk: all shaders: building every program's shader libraries (cache %zu KB)", cache_kb);
     const auto t0 = std::chrono::steady_clock::now();
@@ -4909,7 +4936,17 @@ void all_shaders_run(void (*progress)(size_t done, size_t total)) {
         if (!blank) blank = std::make_unique<NvnState>(), blank->nvattr = 16;
         if ((++seen & 255) == 0 && keep.load() && private_mb() - mem0 > cap_mb) {
             keep = false;
-            logf("vk: all shaders: %lld MB more memory than before: the rest are cached, not kept", (long long)cap_mb);
+            logf("vk: all shaders: %lld MB more memory than before: the rest are left to play (built on a worker when first met)",
+                 (long long)cap_mb);
+        }
+        // (tameem) past the memory cap a library is not kept, and one only cached was of no use in play (a draw there builds
+        // the whole pipeline, from another cache): hours of compiling for nothing once the census took in the effects' programs.
+        // Those programs are translated (prepare_run) and their pipelines built on a worker when first drawn, the draw going
+        // ahead a few frames later; it never stops the game. RX_VK_ALL_SHADERS_PAST_CAP=1: cached all the same, as before
+        static const bool past_cap_cached = getenv("RX_VK_ALL_SHADERS_PAST_CAP") && atoi(getenv("RX_VK_ALL_SHADERS_PAST_CAP"));
+        if (!keep.load() && !past_cap_cached) {
+            past_cap++;
+            return;
         }
         tl_lib_cache = libcache;
         ensure_layout(p);   // (the layout stays: the libraries were made with it)
@@ -4948,9 +4985,9 @@ void all_shaders_run(void (*progress)(size_t done, size_t total)) {
     vkDestroyPipelineCache(dev.device, libcache, nullptr);   // (the kept libraries do not need it)
     remove(running.c_str());
     all_shaders_done.store(kept.load() > 0, std::memory_order_release);
-    logf("vk: all shaders: %zu programs, %lld libraries kept (%lld compiled now, the rest from the cache; %lld failed) in %.1f s; "
-         "cache %zu KB; memory %lld -> %lld MB", programs, (long long)kept.load(), (long long)compiled.load(), (long long)failed.load(),
-         secs, cache_kb, (long long)mem0, (long long)private_mb());
+    logf("vk: all shaders: %zu programs, %lld libraries kept (%lld compiled now, the rest from the cache; %lld failed; %lld programs "
+         "past the memory cap) in %.1f s; cache %zu KB; memory %lld -> %lld MB", programs, (long long)kept.load(), (long long)compiled.load(),
+         (long long)failed.load(), (long long)past_cap.load(), secs, cache_kb, (long long)mem0, (long long)private_mb());
 }
 
 // (tameem) Optimised compute pipelines built in the background for programs that run a quick one: handed over at the program's
