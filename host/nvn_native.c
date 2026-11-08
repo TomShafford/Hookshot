@@ -299,18 +299,43 @@ NV(nvnMemoryPoolFinalize) {
     }
     o->magic = 0;
 }
-NV(nvnMemoryPoolGetFlags) { RET(((const nvn_pool *)P(0))->flags); }
-NV(nvnMemoryPoolGetSize) { RET(((const nvn_pool *)P(0))->size); }
+/* (tameem) A pool asked about that is not there: OoT's thread "OptimizeChangeBank..." (f_80905130, from f_814f28c0) makes buffers
+   on a block whose pool pointer is still null at times (after a backflip and an attack, 3 crashes in 10 sessions; the console's
+   timing seems never to meet it) and then asks the null pool for its flags: the game closed reading guest address 4. Answered 0,
+   as for a pool with nothing in it (nvnBufferInitialize refuses the buffer, below); the first time logged with the game's frames */
+static int null_pool(Ctx *c, const char *what) {
+    if (P(0)) return 0;
+    static volatile LONG told;
+    if (InterlockedIncrement(&told) <= 3) {
+        void hos_backtrace(void);
+        hos_log("nvn: %s of a null memory pool: answered 0 (lr %#llx)", what, (unsigned long long)c->x[30]);
+        hos_backtrace();
+    }
+    return 1;
+}
+NV(nvnMemoryPoolGetFlags) {
+    if (null_pool(c, "GetFlags")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->flags);
+}
+NV(nvnMemoryPoolGetSize) {
+    if (null_pool(c, "GetSize")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->size);
+}
 NV(nvnMemoryPoolMap) {
     const nvn_pool *o = (const nvn_pool *)P(0);
+    if (null_pool(c, "Map")) { RET(0); return; }
     if (o->magic != NVN_MAGIC('P', 'O', 'O', 'L') || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { RET(0); return; }
     if (!o->mem) die("CPU mapping of a virtual pool");
     RETP(o->mem);
 }
-NV(nvnMemoryPoolGetBufferAddress) { RET(((const nvn_pool *)P(0))->gpu); }
+NV(nvnMemoryPoolGetBufferAddress) {
+    if (null_pool(c, "GetBufferAddress")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->gpu);
+}
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     const nvn_pool *o = (const nvn_pool *)P(0);
+    if (null_pool(c, "InvalidateMappedRange")) return;
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
@@ -388,7 +413,13 @@ NV(nvnBufferBuilderSetStorage) {
 NV(nvnBufferInitialize) {
     const nvn_buffer_builder *b = (const nvn_buffer_builder *)P(1);
     if (!b->pool || b->pool->magic != NVN_MAGIC('P', 'O', 'O', 'L') || b->off < 0 || (uint64_t)b->off > b->pool->size ||
-        b->size > b->pool->size - (uint64_t)b->off) { RET(0); return; }
+        b->size > b->pool->size - (uint64_t)b->off) {
+        /* (tameem) refused: left empty, so that what the game asks of it later finds no pool rather than the bytes the
+           object held before (its address 0, its map null) */
+        if (P(0)) memset(P(0), 0, sizeof(nvn_buffer));
+        RET(0);
+        return;
+    }
     nvn_buffer *o = (nvn_buffer *)P(0);
     o->magic = NVN_MAGIC('B', 'U', 'F', 0);
     o->pool = b->pool;
