@@ -2128,6 +2128,13 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             }
         }
         if (presents % 300 == 0) pipeline_cache_save(false);
+        {   // (tameem) RX_VK_PROBE=2: F9 writes what the probe kept of the last 16 frames (probe_all_<n>.txt in the game's folder):
+            // with RX_VK_PROBE_UBO=<programs> and RX_VK_PROBE_UBO_HEX=1 their constants, for finding the camera's matrices
+            static bool probe_was;
+            const bool probe_down = probe_on() && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            if (probe_down && !probe_was) probe_dump_all("F9");
+            probe_was = probe_down;
+        }
         {   // (RX_VK_DUMP_KEY: F9 dumps the next frame, 8 times at most)
             static const bool dump_key = getenv("RX_VK_DUMP_KEY") != nullptr;
             static bool was_down;
