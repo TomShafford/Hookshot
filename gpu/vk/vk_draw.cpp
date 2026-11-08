@@ -3278,6 +3278,7 @@ void end_pass(VkCommandBuffer cmd) {
             char what[64];
             snprintf(what, sizeof what, "sampled by %016llx", (unsigned long long)pass.prog);
             for (uint32_t l = 0; l < std::min<uint32_t>(t->layers, 2); l++) dump_image(cmd, t, 0, l, what);
+            dump_image_raw(cmd, t, 0, what);   // (tameem: BC ones do not blit; their blocks, every layer)
             if (t->guest_size >= (8u << 20)) texture_log_guest(t);   // (and what the game's memory holds of it)
             for (uint32_t lv = 1; t->layers == 1 && lv < std::min<uint32_t>(t->levels, 8); lv++) {   // (every level)
                 snprintf(what, sizeof what, "sampled by %016llx level %u", (unsigned long long)pass.prog, lv);

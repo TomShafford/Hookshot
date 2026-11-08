@@ -22,6 +22,9 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
 /// 32-bit words counted and the first ones listed (RX_VK_DUMP_SSBO=<prog>,...: the storage buffers of those programs'
 /// dispatches, as the GPU has them before the dispatch and after it)
 void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSize n, const char* what);
+/// (tameem) Records the copy of a level of a compressed (BC) image as its blocks, all its layers (they do not blit): written
+/// to the dump's folder as raw_<what>_#<id>_<gpu>_f<format>_<w>x<h>x<layers>_l<level>.bin, decoded off line
+void dump_image_raw(VkCommandBuffer cmd, Texture* tex, uint32_t level, const char* what);
 /// Copies were recorded into the submission being made (it has to complete before dump_write)
 bool dump_pending();
 /// Writes and frees the copies (their submission completed)

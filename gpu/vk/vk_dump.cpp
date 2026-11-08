@@ -393,6 +393,46 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
 }
 
 namespace {
+/// (tameem) a compressed image's level copied as its blocks, every layer (dump_image_raw)
+struct RawItem {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    void* map = nullptr;
+    uint64_t n = 0;
+    std::string name;
+};
+std::vector<RawItem> raw_items;
+} // namespace
+
+void dump_image_raw(VkCommandBuffer cmd, Texture* tex, uint32_t level, const char* what) {
+    if (!armed || !tex || !tex->image || tex->samples != VK_SAMPLE_COUNT_1_BIT || !(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    const int f = (int)tex->format;
+    const uint32_t block = f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK ? 8
+                         : f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK ? 8
+                         : f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK ? 16 : 0;
+    if (!block || tex->type == VK_IMAGE_TYPE_3D) return;
+    level = std::min(level, tex->levels - 1);
+    const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+    const uint32_t layers = std::min<uint32_t>(tex->layers, 256);
+    const uint64_t per_layer = (uint64_t)((w + 3) / 4) * ((h + 3) / 4) * block;
+    const uint64_t n = per_layer * layers;
+    if (!n || n > (64ull << 20)) return;
+    RawItem it;
+    it.n = n;
+    char name[200];
+    snprintf(name, sizeof name, "raw_%s_#%u_%llx_f%d_%ux%ux%u_l%u.bin", what, tex->id, (unsigned long long)tex->gpu, f, w, h, layers, level);
+    for (char* c = name; *c; c++)
+        if (*c == ' ' || *c == ':' || *c == '/' || *c == '\\') *c = '_';
+    it.name = name;
+    if (!create_buffer(n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, it.buffer, it.alloc, &it.map) || !it.map) return;
+    full_barrier(cmd);
+    const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, layers}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, it.buffer, 1, &c);
+    full_barrier(cmd);
+    raw_items.push_back(std::move(it));
+}
+
+namespace {
 struct BufItem {
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -426,7 +466,7 @@ void dump_buffer(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize off, VkDeviceSi
 }
 
 bool dump_pending() {
-    return !items.empty() || !buf_items.empty();
+    return !items.empty() || !buf_items.empty() || !raw_items.empty();
 }
 
 void dump_write() {
@@ -452,6 +492,14 @@ void dump_write() {
         destroy_buffer(it.buffer, it.alloc);
     }
     buf_items.clear();
+    for (RawItem& it : raw_items) {
+        const std::string path = dir + "/" + it.name;
+        bool ok = false;
+        if (FILE* f = fopen(path.c_str(), "wb")) ok = fwrite(it.map, 1, it.n, f) == it.n, fclose(f);
+        logf("vk: dump raw blocks %s: %llu bytes%s", path.c_str(), (unsigned long long)it.n, ok ? "" : " (NOT written)");
+        destroy_buffer(it.buffer, it.alloc);
+    }
+    raw_items.clear();
 }
 
 } // namespace mkwvk
