@@ -92,11 +92,22 @@ int main() {
         IR::Inst* b = load(V(addr64(lo2, carry_hi(cbuf(0, 0x794), lo2))));
         CollectStorageBuffers(block, *b, info);
         expect(info.set.size() == 1 && info.set.begin()->index == 0 && info.set.begin()->offset == 0x790, "pass: table slot bound");
-        g_task_mesh_table = 0;   // a vertex program: as before
+        g_task_mesh_table = 0;   // a fragment program: as before
         StorageInfo info2;
         g_mesh_offsets_refused = 0;
         CollectStorageBuffers(block, *a, info2);
         expect(info2.set.size() == 1 && info2.set.begin()->index == 5 && g_mesh_offsets_refused == 0, "pass: other stages unchanged");
+        g_vertex_stage = true;   // a vertex program: the same check as task and mesh (Maxwell's bias kept)
+        StorageInfo info3;
+        CollectStorageBuffers(block, *a, info3);
+        expect(info3.set.empty() && g_mesh_offsets_refused == 1, "pass: a vertex stage's offset left global, counted");
+        IR::Inst* lo4 = mk(IR::Opcode::IAdd32, {V(cbuf(4, 0x40)), V(load(V(base_ptr_addr)))});
+        IR::Inst* c4 = load(V(addr64(lo4, carry_hi(cbuf(4, 0x44), lo4))));
+        StorageInfo info4;
+        CollectStorageBuffers(block, *c4, info4);
+        expect(info4.set.size() == 1 && info4.set.begin()->index == 4 && info4.set.begin()->offset == 0x40,
+               "pass: a vertex stage's real pointer in c4 still bound");
+        g_vertex_stage = false;
     }
     std::printf("%d failed\n", fails);
     return fails != 0;

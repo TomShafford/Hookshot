@@ -637,6 +637,11 @@ thread_local bool g_follow_stage = false;   // (hookshot: the program being tran
 // (tameem) the program being translated is a task or mesh stage: where its NVN2 storage buffer table is in c0 (0x670 task, 0x770
 // mesh: translate_program.cpp AddNVNStorageBuffers, vk_bank.cpp kSsboTable), 0 otherwise
 thread_local u32 g_task_mesh_table = 0;
+// (tameem) the program being translated is a vertex stage (VertexB): its addresses get the same check as task and mesh ones
+// (HighFromDescriptor). OoT's d76e73cfbe651494 bound c4+0x40, a word that holds an instance's position (148.1, -62.4: "storage
+// buffer NOT bound (reads zeros)" at each draw), as 95db514a35353e28 did c4+0x40's 100.0 and 10.0. Refused, the address is read
+// through the page table, as graphics stages follow pointers (spirv_emit_context.cpp, RX_VK_FOLLOW_GRAPHICS)
+thread_local bool g_vertex_stage = false;
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
@@ -731,7 +736,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
         }
         // (tameem) task and mesh: a word whose neighbour is not the address's high word is an offset (HighFromDescriptor), and the
         // address is left to the run-time search (the stage's table, its tables, the pointer table's pools) like any other not tracked
-        if (storage_buffer && g_task_mesh_table && !HighFromDescriptor(low_addr_info->high, *storage_buffer)) {
+        if (storage_buffer && (g_task_mesh_table || g_vertex_stage) && !HighFromDescriptor(low_addr_info->high, *storage_buffer)) {
             ++g_mesh_offsets_refused;
             storage_buffer.reset();
         }
@@ -888,6 +893,7 @@ void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateIn
     static const bool no_mesh{std::getenv("RX_VK_FOLLOW_MESH") == nullptr};
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
     g_task_mesh_table = program.stage == Stage::Task ? 0x670U : program.stage == Stage::Mesh ? 0x770U : 0U;
+    g_vertex_stage = program.stage == Stage::VertexB;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     StorageInfo info;
     const u32 refused_before{g_mesh_offsets_refused};

@@ -47,6 +47,7 @@
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
 namespace mkwvk {
+void program_mark_retranslate(uint64_t key);   // (tameem: vk_shader.cpp, a vertex stage's offset taken for an address)
 // (EvilOOT, RX_VK_DRAW_STATS: the pointer table's regions, vk_bank.cpp)
 struct PointerEntry { uint64_t addr, size; };
 const PointerEntry* pointer_table(const NvnState& s, int stage);
@@ -1917,6 +1918,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     }
                 }
                 if (addr && plausible && !b) {   // (a storage buffer that could not be bound: the program reads zeros from it)
+                    // (tameem: a vertex stage's from the game's banks: an offset taken for an address. Its program is translated again
+                    // at the next start, with the vertex address check, vk_shader.cpp stale_vertex_record)
+                    if (ns == 0 && d.cbuf_index >= 3) program_mark_retranslate(p.key);
                     static std::atomic<int> unbound{0};
                     if (unbound++ < 40)
                         logf("vk: storage buffer NOT bound (reads zeros): program %016llx stage %d c%u+%#x addr %#llx size "

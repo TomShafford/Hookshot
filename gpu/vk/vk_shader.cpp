@@ -796,6 +796,20 @@ constexpr uint32_t kKindMeshPoints = 16;
 /// (tameem) A mesh record made before the newest of these fixes: every mesh program, as the stage buffer's prologue changed for all
 /// of them (this covers the earlier rules: a buffer bound outside the stage's table, kind 4; offsets left to the search alone, kind 8)
 bool stale_mesh_record(uint32_t kind) { return (kind & 2) && !(kind & kKindMeshPoints); }
+// (tameem) and 32: made by a translator whose vertex stages get the same address check (11-08, g_vertex_stage: OoT's
+// d76e73cfbe651494 bound an instance's position, c4+0x40, as a buffer). Which kept graphics programs that changes shows only where
+// they draw: a vertex stage's buffer from the game's own banks that no buffer holds ("storage buffer NOT bound"). Such a program's key
+// goes into hookshot_retranslate.txt beside the cache (program_mark_retranslate, vk_draw.cpp), and its record without 32 is left out
+// at the next start: translated again then. The rest keep theirs, however many vertex buffers they bind from the game's banks
+constexpr uint32_t kKindVertexOffsets = 32;
+std::mutex retrans_mu;
+std::unordered_set<uint64_t> retrans_keys;
+std::string retrans_path;
+bool stale_vertex_record(uint32_t kind, uint64_t key) {
+    if ((kind & 3) || (kind & kKindVertexOffsets)) return false;
+    std::lock_guard lk(retrans_mu);
+    return retrans_keys.count(key) != 0;
+}
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
@@ -843,6 +857,17 @@ void disk_init() {
         const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
         std::string path(exe, n);
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
+        {   // (tameem: the programs to translate again, kept graphics programs found binding nothing: stale_vertex_record)
+            std::lock_guard lk(retrans_mu);
+            retrans_path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_retranslate.txt";
+            if (FILE* f = fopen(retrans_path.c_str(), "r")) {
+                char line[64];
+                while (fgets(line, sizeof line, f))
+                    if (const uint64_t k = strtoull(line, nullptr, 16)) retrans_keys.insert(k);
+                fclose(f);
+            }
+            if (!retrans_keys.empty()) logf("vk: %zu graphics programs marked to translate again (hookshot_retranslate.txt)", retrans_keys.size());
+        }
         const uint64_t stamp = disk_stamp();
         int64_t good = 0, whole = 0;
         if (FILE* f = fopen(path.c_str(), "rb")) {
@@ -970,7 +995,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -992,7 +1017,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing)
-        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints)});
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints | kKindVertexOffsets)});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1035,7 +1060,7 @@ void drop_stale(uint64_t key, std::unique_ptr<Program>& p) {
     for (Stage& st : p->stages)
         if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
     p.reset();
-    if (st_stale_mesh++ < 60) logf("vk: mesh program %016llx: a record from before the storage buffer fixes left out (translated again where no newer one is kept)",
+    if (st_stale_mesh++ < 60) logf("vk: program %016llx: a record from before the storage buffer fixes left out (translated again where no newer one is kept)",
                                      (unsigned long long)key);
 }
 
@@ -1058,7 +1083,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         auto p = program_from_record(key, data);
-        if (p && stale_mesh_record(d.kind)) drop_stale(key, p);
+        if (p && (stale_mesh_record(d.kind) || stale_vertex_record(d.kind, key))) drop_stale(key, p);
         if (!p) continue;
         variants.push_back(std::move(p));
         st_cache_hits++;
@@ -1067,6 +1092,19 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
 
 
 } // namespace   (tameem: program_cache_each_graphics is called from vk_draw.cpp)
+
+/// (tameem) A kept program's vertex stage was found binding a buffer from the game's banks that no buffer holds: its key is written to
+/// hookshot_retranslate.txt, once, and its record from before the vertex address check is left out at the next start (stale_vertex_record)
+void program_mark_retranslate(uint64_t key) {
+    std::lock_guard lk(retrans_mu);
+    if (retrans_path.empty() || !retrans_keys.insert(key).second) return;
+    if (FILE* f = fopen(retrans_path.c_str(), "a")) {
+        fprintf(f, "%016llx\n", (unsigned long long)key);
+        fclose(f);
+    }
+    logf("vk: program %016llx: marked to translate again at the next start (its vertex stage reads a buffer no buffer holds)",
+         (unsigned long long)key);
+}
 
 /// (tameem) Every kept graphics program, read from hookshot_programs.bin one at a time on `threads` threads and given to fn, then let go
 /// (its shader modules destroyed; what fn made from it stays). The cache is left as it is: a draw still reads its program back as before
@@ -1098,7 +1136,7 @@ size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsi
             }
             if (read)
                 if (std::unique_ptr<Program> p = program_from_record(recs[i].first, data)) {
-                    if (stale_mesh_record(recs[i].second.kind)) {   // (translated again at its first draw: no pipeline for this one)
+                    if (stale_mesh_record(recs[i].second.kind) || stale_vertex_record(recs[i].second.kind, recs[i].first)) {   // (translated again at its first draw: no pipeline for this one)
                         drop_stale(recs[i].first, p);
                         done++;
                         continue;
@@ -1276,6 +1314,12 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
         if (questions) record_answers(p, s);
         st_translated++;
         ptr_diag_log(p.key, csc ? "compute" : fsc ? "graphics" : "vertex");
+        if (const uint32_t refused = Shader::Optimization::g_mesh_offsets_refused) {   // (tameem: HighFromDescriptor, vertex stages)
+            static std::atomic<int> told{0};
+            if (told++ < 60)
+                logf("vk: program %016llx: %u vertex address(es) with an offset from a constant buffer read through the page table, "
+                     "not bound as that word's buffer", (unsigned long long)p.key, refused);
+        }
         program_cache_save(p, kept);
     } catch (const std::exception& e) {
         p.failed = true;
