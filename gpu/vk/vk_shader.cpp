@@ -107,7 +107,7 @@ struct Code {
     uint32_t texture_bound = ~0u;   // the bank native TEX instructions name (~0: none; TEXS take the stage's own)
     bool isbe = false;              // an NVN2 task (stage 6) or mesh (stage 7) program: it writes the internal stage buffer
     // (task / mesh: control section +0x58 threads 15:0, payload bytes 31:16; +0x60 max primitives 15:0, max vertices
-    // 31:16; +0x5f the output topology, 3 triangles)
+    // 31:16; +0x5f the output topology, 1 points, 3 triangles)
     uint32_t mesh_threads = 0, payload_bytes = 0, max_vertices = 0, max_primitives = 0, topology = 0;
     bool header_only = false;       // a graphics header and no code (NVN2's per-primitive output map of a mesh program)
     uint8_t sph[sizeof(Shader::ProgramHeader)]{};
@@ -789,6 +789,13 @@ constexpr uint32_t kKindMeshBufferFix = 4;
 // (tameem) and 8: made by a translator whose task and mesh stages follow pointers where the storage buffer fix left an address to the
 // search (11-08, g_follow_refused_stage). A mesh record with 4 and not 8 came from the build in between: translated again
 constexpr uint32_t kKindMeshFollow = 8;
+// (tameem) and 16: made by a translator with upstream's two AMD mesh fixes (11-08): a mesh program with control topology 1 draws
+// points (674d6e1, issue 302: the near grass shadow's streaks and dark mesh around Link), and its stage buffer starts at zero
+// (ae4fb30: leftovers of earlier workgroups as vertices). Every mesh record without it is translated again
+constexpr uint32_t kKindMeshPoints = 16;
+/// (tameem) A mesh record made before the newest of these fixes: every mesh program, as the stage buffer's prologue changed for all
+/// of them (this covers the earlier rules: a buffer bound outside the stage's table, kind 4; offsets left to the search alone, kind 8)
+bool stale_mesh_record(uint32_t kind) { return (kind & 2) && !(kind & kKindMeshPoints); }
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
@@ -874,6 +881,19 @@ void disk_init() {
         }
         disk_in = disk_out ? fopen(path.c_str(), "rb") : nullptr;
         disk_on = disk_out != nullptr && disk_in != nullptr;
+        {   // (tameem: mesh records made before the newest mesh fixes left out here, by their kind alone: their programs are
+            // translated again, by the shader census at the start where it makes them, else at their first draw)
+            size_t stale = 0;
+            for (auto it = disk_records.begin(); it != disk_records.end();) {
+                auto& recs = it->second;
+                const size_t before = recs.size();
+                recs.erase(std::remove_if(recs.begin(), recs.end(), [](const DiskRecord& d) { return stale_mesh_record(d.kind); }),
+                           recs.end());
+                stale += before - recs.size();
+                it = recs.empty() ? disk_records.erase(it) : std::next(it);
+            }
+            if (stale) logf("vk: program cache: %zu mesh records from before the latest mesh fixes left out (translated again)", stale);
+        }
         logf("vk: program cache %s: %zu program keys kept, %lld KB", path.c_str(), disk_records.size(), (long long)(good >> 10));
     });
 }
@@ -950,7 +970,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -972,7 +992,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing)
-        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow)});
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow | kKindMeshPoints)});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1010,21 +1030,6 @@ std::unique_ptr<Program> program_from_record(uint64_t key, const std::vector<uin
     return p;
 }
 
-/// (tameem) A mesh program kept before the task and mesh storage buffer fix that the fix changes: a task or mesh stage with a buffer
-/// bound from anywhere but its own table in c0 (0x670 task, 0x770 mesh). What its translation took for a buffer there may be an
-/// offset (OoT's grass: c5+0x60 bound, zeros read), so it is translated again; programs whose buffers are all their table's
-/// translate as before and keep their record
-bool stale_mesh_record(uint32_t kind, const Program& p) {
-    if (!(kind & 2)) return false;
-    if (kind & kKindMeshBufferFix) return !(kind & kKindMeshFollow);   // (the build in between: its offsets left to the search alone)
-    for (const Stage& st : p.stages) {
-        if (st.nvn_stage != 6 && st.nvn_stage != 7) continue;
-        const uint32_t table = st.nvn_stage == 6 ? 0x670 : 0x770;
-        for (const auto& d : st.info.storage_buffers_descriptors)
-            if (d.count == 1 && !(d.cbuf_index == 0 && d.cbuf_offset >= table && d.cbuf_offset < table + 16 * 16)) return true;
-    }
-    return false;
-}
 std::atomic<int> st_stale_mesh{0};
 void drop_stale(uint64_t key, std::unique_ptr<Program>& p) {
     for (Stage& st : p->stages)
@@ -1053,7 +1058,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
         auto p = program_from_record(key, data);
-        if (p && stale_mesh_record(d.kind, *p)) drop_stale(key, p);
+        if (p && stale_mesh_record(d.kind)) drop_stale(key, p);
         if (!p) continue;
         variants.push_back(std::move(p));
         st_cache_hits++;
@@ -1093,7 +1098,7 @@ size_t program_cache_each_graphics(const std::function<void(Program&)>& fn, unsi
             }
             if (read)
                 if (std::unique_ptr<Program> p = program_from_record(recs[i].first, data)) {
-                    if (stale_mesh_record(recs[i].second.kind, *p)) {   // (translated again at its first draw: no pipeline for this one)
+                    if (stale_mesh_record(recs[i].second.kind)) {   // (translated again at its first draw: no pipeline for this one)
                         drop_stale(recs[i].first, p);
                         done++;
                         continue;
@@ -1302,7 +1307,11 @@ void miss_note(uint64_t key, const char* what, uint64_t a, uint64_t b, const Nvn
 }
 
 std::array<u32, 3> mesh_registers_of(const Code* task, const Code& mesh) {
-    const uint32_t topology = mesh.topology == 3 ? 4 : mesh.topology;   // (triangles)
+    // (the control section's topology in GL's numbers: 3 triangles; 1 points, not lines. OoT's four mesh programs with a 1 (the grass
+    // drawn into the 2400 x 2400 shadow map around Link) write one index byte per primitive, the primitive count = their vertex
+    // count, and a point size. Read as lines, each joined vertex 2i to 2i + 1 of its meshlet: a mesh of long thin dark stripes on
+    // the ground, the water and Link around him, on AMD; Hookshot issue 302)
+    const uint32_t topology = mesh.topology == 3 ? 4 : mesh.topology == 1 ? 0 : mesh.topology;
     const uint32_t lines = task ? (task->payload_bytes + 127) / 128 : 0;
     // (the larger of the two for both: the control section's pair is not always vertices and primitives in that order. The door's
     // says 126 and 64, where its code writes 64 vertices and up to 128 primitives; held to 64, a meshlet's other primitives were
@@ -1395,6 +1404,13 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
                 if (Shader::IR::IsGeneric(attribute))
                     frt.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
             }
+            // (points: a generic the fragment program reads and the mesh program never writes is the point sprite's coordinate,
+            // as the hardware replaces it. OoT's grass shadow reads its alpha mask at generic 5's (s, t): left at (0, 0, 0, 1),
+            // each point was a filled square in the shadow map instead of a tuft)
+            if (mesh_t->program.mesh.topology == 0)
+                for (size_t i = 0; i < Shader::IR::NUM_GENERICS; i++)
+                    if (fs->program.info.loads.Generic(i) && !mesh_t->program.info.stores.Generic(i))
+                        frt.point_coord_generics.set(i);
             for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
             const std::vector<uint32_t> fspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), frt, fs->program, bindings);
             kept.push_back(fspirv);

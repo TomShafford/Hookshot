@@ -161,8 +161,8 @@ void MeshEpilogue(EmitContext& ctx) {
     for (u32 first = 0; first < mesh.max_primitives; first += threads) {
         const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
-            // Vertex indices: map bytes 4 + 3 * primitive (lines: 4 + 2 * primitive).
-            const u32 corners{mesh.topology == 1 ? 2U : 3U};
+            // Vertex indices: map bytes 4 + 3 * primitive (lines: 4 + 2 * primitive, points: 4 + primitive).
+            const u32 corners{mesh.Corners()};
             const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(corners)),
                                      ctx.Const(4U))};
             std::array<Id, 3> indices;
@@ -175,7 +175,9 @@ void MeshEpilogue(EmitContext& ctx) {
             }
             const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[corners])};
             ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
-                        ctx.OpCompositeConstruct(ctx.U32[corners], std::span<const Id>(indices.data(), corners)));
+                        corners == 1 ? indices[0]   // (a point's index is a scalar)
+                                     : ctx.OpCompositeConstruct(ctx.U32[corners],
+                                                                std::span<const Id>(indices.data(), corners)));
             CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
                       ctx.mesh_primitive_targets);
         });
@@ -242,6 +244,27 @@ void EmitMeshPrologue(EmitContext& ctx) {
     }
     if (ctx.stage != Stage::Mesh) {
         return;
+    }
+    // (local) The stage buffer's map and attribute regions start at zero, as they come out on NVIDIA: workgroup memory holds
+    // whatever the last workgroup on that unit left, and a vertex or an index byte the program left unwritten was that. On an
+    // RX 7700S the foliage drawn into the 2400 x 2400 shadow map around Link came out with hundreds of long thin triangles
+    // across the whole map (vertices from other meshlets' leftovers), dark lines on the ground, the water and Link that
+    // changed every frame. Zeroed, such a primitive is (0,0,0): no area. Straight-line stores, each clamped into its array
+    // (no branch: see below). RX_VK_MESH_NO_ZERO=1: as before
+    static const bool no_zero{std::getenv("RX_VK_MESH_NO_ZERO") != nullptr};
+    if (!no_zero && ctx.mesh_threads) {
+        const Id invocation{LocalInvocation(ctx)};
+        const auto zero_all = [&](Id array, u32 count) {
+            if (!Sirit::ValidId(array) || count == 0) {
+                return;
+            }
+            for (u32 first = 0; first < count; first += ctx.mesh_threads) {
+                const Id at{Clamped(ctx, ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)), count)};
+                ctx.OpStore(SharedWord(ctx, array, at), ctx.u32_zero_value);
+            }
+        };
+        zero_all(ctx.mesh_map, ctx.mesh_map_bytes);
+        zero_all(ctx.mesh_attributes, ctx.mesh_attribute_words);
     }
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
