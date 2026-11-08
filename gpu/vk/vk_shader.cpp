@@ -560,7 +560,7 @@ std::vector<uint32_t> invariant_position(const std::vector<uint32_t>& in, int& a
 /// (tameem) A stage's module, for program key: RX_VK_INVARIANT=<keys>|mesh|all (unset: off): its Position Invariant
 /// (invariant_position; the program cache keeps the SPIR-V as translated; a changed module is a new pipeline for the driver). RX_VK_SPV=<keys>: the SPIR-V written to
 /// spv_<key>_<stage>.spv in the working folder as the module is made (kept programs too: nothing translated again), for spirv-dis
-VkShaderModule make_stage_module(const std::vector<uint32_t>& spirv, uint64_t key, bool mesh, VkShaderStageFlagBits stage) {
+VkShaderModule make_stage_module(const std::vector<uint32_t>& translated, uint64_t key, bool mesh, VkShaderStageFlagBits stage) {
     static const char* invariant_list = [] {
         const char* e = getenv("RX_VK_INVARIANT");
         return !e || !strcmp(e, "0") ? "" : e;
@@ -569,6 +569,31 @@ VkShaderModule make_stage_module(const std::vector<uint32_t>& spirv, uint64_t ke
     const char* name = stage == VK_SHADER_STAGE_TASK_BIT_EXT ? "task" : stage == VK_SHADER_STAGE_MESH_BIT_EXT ? "mesh"
                      : stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex" : stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fragment"
                      : stage == VK_SHADER_STAGE_COMPUTE_BIT ? "compute" : "other";
+    // (tameem) RX_VK_SPV_OVERRIDE=<folder>: a stage whose <folder>\spv_<key>_<stage>.spv exists is made from that file instead of its
+    // translation (a SPIR-V module, edited off line: what the driver makes of one change to one program, with nothing translated again
+    // and the program cache as it was). Unset: off
+    std::vector<uint32_t> replaced;
+    {
+        static const char* override_dir = getenv("RX_VK_SPV_OVERRIDE");
+        if (override_dir && *override_dir) {
+            char path[640];
+            snprintf(path, sizeof path, "%s\\spv_%016llx_%s.spv", override_dir, (unsigned long long)key, name);
+            if (FILE* f = fopen(path, "rb")) {
+                _fseeki64(f, 0, SEEK_END);
+                const int64_t n = _ftelli64(f);
+                _fseeki64(f, 0, SEEK_SET);
+                if (n >= 20 && n % 4 == 0 && n < (64ll << 20)) {
+                    replaced.resize((size_t)n / 4);
+                    if (fread(replaced.data(), 4, replaced.size(), f) != replaced.size() || replaced[0] != 0x07230203u) replaced.clear();
+                }
+                fclose(f);
+                logf("vk: program %016llx, %s stage: %s (RX_VK_SPV_OVERRIDE, %lld bytes)", (unsigned long long)key, name,
+                     replaced.empty() ? "the override file is not a SPIR-V module, the translation kept" : "made from the override file",
+                     (long long)n);
+            }
+        }
+    }
+    const std::vector<uint32_t>& spirv = replaced.empty() ? translated : replaced;
     if (spv_list && key_in_list(spv_list, key, mesh)) {
         char path[96];
         snprintf(path, sizeof path, "spv_%016llx_%s.spv", (unsigned long long)key, name);

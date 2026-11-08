@@ -352,10 +352,13 @@ bool skip_live(uint64_t key) {
 /// less, greater, equal, notequal, never. OoT's foliage colour passes test EQUAL against their depth pre-pass: one listed with always
 /// that then colours its tall grass tops places them where its pre-pass did not (the vertex math differs); still white, its
 /// fragments are not there at all
-bool depth_live(uint64_t key, VkCompareOp& op) {
+LiveList& depth_list() {
     static LiveList list("RX_VK_DEPTH_FILE");
+    return list;
+}
+bool depth_live(uint64_t key, VkCompareOp& op) {
     std::string w;
-    if (!list.find(key, &w)) return false;
+    if (!depth_list().find(key, &w) || w == "clamp" || w == "noclamp") return false;
     op = w == "le" || w == "lequal" || w == "less_or_equal" ? VK_COMPARE_OP_LESS_OR_EQUAL
        : w == "ge" || w == "gequal" || w == "greater_or_equal" ? VK_COMPARE_OP_GREATER_OR_EQUAL
        : w == "less" || w == "lt" ? VK_COMPARE_OP_LESS
@@ -364,6 +367,14 @@ bool depth_live(uint64_t key, VkCompareOp& op) {
        : w == "notequal" || w == "ne" ? VK_COMPARE_OP_NOT_EQUAL
        : w == "never" ? VK_COMPARE_OP_NEVER : VK_COMPARE_OP_ALWAYS;
     return true;
+}
+/// (tameem) and "<key> clamp" / "<key> noclamp" there: that program's depth clamp on or off (the clipper's near and far planes off or
+/// on), live, its compare op as the game asks
+void clamp_live(uint64_t key, VkBool32& clamp) {
+    std::string w;
+    if (!depth_list().find(key, &w)) return;
+    if (w == "clamp") clamp = VK_TRUE;
+    else if (w == "noclamp") clamp = VK_FALSE;
 }
 void stats_note_bind(uint64_t prog, int stage, uint64_t addr, uint64_t size, bool written, bool table, uint32_t cbuf = 0,
                      uint32_t off = 0, uint64_t raw = 0, uint64_t vkbuf = 0, uint64_t vkoff = 0) {
@@ -2653,7 +2664,9 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     d.poly = s.poly.mode == 0 ? VK_POLYGON_MODE_POINT : s.poly.mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
     static const bool fp_lines = getenv("RX_VK_FOOTPRINT_LINES") != nullptr;   // (the footprints as wireframes)
     if (fp && fp_lines) d.poly = VK_POLYGON_MODE_LINE;
-    d.clamp = s.depth_clamp, d.a2c = s.ms.a2c != 0 && !no_a2c() && !(cur_program && a2c_dithers(*cur_program, s, at));   // (tameem)
+    d.clamp = s.depth_clamp;
+    if (cur_program) clamp_live(cur_program->key, d.clamp);   // (tameem: RX_VK_DEPTH_FILE)
+    d.a2c = s.ms.a2c != 0 && !no_a2c() && !(cur_program && a2c_dithers(*cur_program, s, at));   // (tameem)
     d.n = dev.eds3_blend ? at.n : 0;
     for (int i = 0; i < d.n; i++) {
         const nvn_blend_st& b = s.blend[i];
@@ -2664,9 +2677,9 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     }
     if (dump_on()) {   // (RX_VK_DUMP: the state a program draws with, once per change)
         char line[400];
-        int k = snprintf(line, sizeof line, "prog %016llx n%d depth %s dt%u dw%u dop%d st%u cull%u front%u vp %.0f,%.0f %.0fx%.0f z %.2f-%.2f sc %d,%d %ux%u:",
+        int k = snprintf(line, sizeof line, "prog %016llx n%d depth %s dt%u dw%u dop%d st%u cull%u front%u clamp%u vp %.0f,%.0f %.0fx%.0f z %.2f-%.2f sc %d,%d %ux%u:",
                          (unsigned long long)(cur_program ? cur_program->key : 0), at.n,
-                         at.depth ? (depth ? "yes" : "stencil") : "no", d.dt, d.dw, (int)d.dop, d.st, d.cull, d.front,
+                         at.depth ? (depth ? "yes" : "stencil") : "no", d.dt, d.dw, (int)d.dop, d.st, d.cull, d.front, (unsigned)d.clamp,
                          d.vp.x, d.vp.y, d.vp.width, d.vp.height, d.vp.minDepth, d.vp.maxDepth, d.sc.offset.x, d.sc.offset.y,
                          d.sc.extent.width, d.sc.extent.height);
         for (int i = 0; i < at.n && k < (int)sizeof line - 40; i++)
@@ -4420,7 +4433,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         for (const int stage : {6, 7, 1}) stats_dump_stage(p.key, s, stage);
         // (and as the GPU holds them, after it: RX_VK_GPU_DUMP=1 only; its bindings can sync a pool's mirror mid-frame, and
         // the culling chain then measured as broken)
-        static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr;
+        static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr || getenv("RX_VK_STATS_GPU_BUFS") != nullptr;
         if (stats_query.cmd && gpu_dump_on) stats_query.state = &s, stats_query.prog = p.key;
     }
     if (d.mesh) {
@@ -5907,7 +5920,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     {
         StatsQuery stats_query(cmd, p.key, indirect, x, y, z);   // (EvilOOT, RX_VK_DRAW_STATS)
         {   // (RX_VK_GPU_DUMP=1 with RX_VK_DRAW_STATS_PROGS: the wanted dispatches' storage buffers as the GPU holds them after)
-            static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr;
+            static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr || getenv("RX_VK_STATS_GPU_BUFS") != nullptr;
             if (gpu_dump_on && stats_query.cmd && stats_prog_wanted(p.key)) stats_query.state = &s, stats_query.prog = p.key;
         }
         if (indirect) {
