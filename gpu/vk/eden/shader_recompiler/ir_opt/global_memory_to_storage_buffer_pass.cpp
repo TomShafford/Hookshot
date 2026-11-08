@@ -46,6 +46,12 @@ extern thread_local bool g_all_global_this;   // (RX_VK_ALL_GLOBAL_PROGS, vk_sha
 /// an offset, not a storage buffer's address (HighFromDescriptor below), left to the run-time search. Read and reset by
 /// gpu/vk/vk_shader.cpp around each mesh program, declared there by hand as g_pointer_diag is
 thread_local u32 g_mesh_offsets_refused{};
+/// (tameem) The task or mesh stage this thread translated last left an address to the run-time search (HighFromDescriptor): its
+/// back end follows pointers through guest memory's page table, as compute does (spirv_emit_context.cpp). The search alone looks in
+/// the stage's table and the pointer table's pools, and OoT's grass colour programs read zeros there: their blades' tops then sat
+/// elsewhere than in the depth pre-pass (its programs read the real data), failed its depth-equal test and kept the cleared
+/// G-buffer, lit as a white-cyan glow
+thread_local bool g_follow_refused_stage{};
 
 namespace {
 bool PointerDiagOn() {
@@ -884,6 +890,7 @@ void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateIn
     g_task_mesh_table = program.stage == Stage::Task ? 0x670U : program.stage == Stage::Mesh ? 0x770U : 0U;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     StorageInfo info;
+    const u32 refused_before{g_mesh_offsets_refused};
     for (IR::Block* const block : program.post_order_blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsGlobalMemory(inst)) {
@@ -892,6 +899,7 @@ void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateIn
             CollectStorageBuffers(*block, inst, info);
         }
     }
+    g_follow_refused_stage = g_mesh_offsets_refused != refused_before;
     for (const StorageBufferAddr& storage_buffer : info.set) {
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = storage_buffer.index,

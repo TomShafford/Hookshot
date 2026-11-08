@@ -2494,6 +2494,11 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     d.dt = !sw().no_depth && depth && s.ds.dt;
     d.dw = !sw().no_depth && depth && s.ds.dw;
     d.dop = compare_op(s.ds.df);
+    // (tameem, diagnosis: RX_VK_DEPTH_EQUAL_LE=1: a colour pass over a depth pre-pass (equal, no depth write) passes less-or-equal
+    // too. OoT draws its foliage twice so; where a colour program places a vertex elsewhere than its pre-pass did, equal fails and
+    // the G-buffer keeps its clear: the grass tops' white-cyan glow)
+    static const bool equal_le = getenv("RX_VK_DEPTH_EQUAL_LE") && atoi(getenv("RX_VK_DEPTH_EQUAL_LE")) != 0;
+    if (equal_le && !d.dw && d.dop == VK_COMPARE_OP_EQUAL) d.dop = VK_COMPARE_OP_LESS_OR_EQUAL;
     if (fp) d.dt = true, d.dw = true, d.dop = VK_COMPARE_OP_ALWAYS;
     d.st = stencil && s.ds.st;
     d.sops[0][0] = stencil_op(s.ds.fail_f), d.sops[0][1] = stencil_op(s.ds.zpass_f), d.sops[0][2] = stencil_op(s.ds.zfail_f);

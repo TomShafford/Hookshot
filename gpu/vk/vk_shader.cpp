@@ -786,6 +786,9 @@ struct DiskRecord { int64_t at; size_t size; uint32_t kind; };
 // global_memory_to_storage_buffer_pass.cpp HighFromDescriptor). The shader stamp was kept for it (gpu/vk/stamp_base), so the hours
 // of translated programs stay: only the mesh programs the fix changes are translated again (stale_mesh_record)
 constexpr uint32_t kKindMeshBufferFix = 4;
+// (tameem) and 8: made by a translator whose task and mesh stages follow pointers where the storage buffer fix left an address to the
+// search (11-08, g_follow_refused_stage). A mesh record with 4 and not 8 came from the build in between: translated again
+constexpr uint32_t kKindMeshFollow = 8;
 std::mutex disk_mu;
 // (read as wanted: with every program of the game in it the file is gigabytes, and it was read into memory whole)
 FILE* disk_in = nullptr;
@@ -947,7 +950,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
@@ -969,7 +972,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
     if (disk_listing)
-        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix)});
+        disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | kKindMeshBufferFix | kKindMeshFollow)});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1012,7 +1015,8 @@ std::unique_ptr<Program> program_from_record(uint64_t key, const std::vector<uin
 /// offset (OoT's grass: c5+0x60 bound, zeros read), so it is translated again; programs whose buffers are all their table's
 /// translate as before and keep their record
 bool stale_mesh_record(uint32_t kind, const Program& p) {
-    if (!(kind & 2) || (kind & kKindMeshBufferFix)) return false;
+    if (!(kind & 2)) return false;
+    if (kind & kKindMeshBufferFix) return !(kind & kKindMeshFollow);   // (the build in between: its offsets left to the search alone)
     for (const Stage& st : p.stages) {
         if (st.nvn_stage != 6 && st.nvn_stage != 7) continue;
         const uint32_t table = st.nvn_stage == 6 ? 0x670 : 0x770;
@@ -1026,7 +1030,7 @@ void drop_stale(uint64_t key, std::unique_ptr<Program>& p) {
     for (Stage& st : p->stages)
         if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
     p.reset();
-    if (st_stale_mesh++ < 60) logf("vk: mesh program %016llx: its record from before the storage buffer fix left out (translated again where no newer one is kept)",
+    if (st_stale_mesh++ < 60) logf("vk: mesh program %016llx: a record from before the storage buffer fixes left out (translated again where no newer one is kept)",
                                      (unsigned long long)key);
 }
 

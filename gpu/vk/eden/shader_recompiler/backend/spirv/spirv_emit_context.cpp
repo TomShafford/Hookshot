@@ -19,6 +19,9 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
+namespace Shader::Optimization {
+extern thread_local bool g_follow_refused_stage;   // (tameem: global_memory_to_storage_buffer_pass.cpp, set for the stage just passed)
+}
 namespace Shader::Backend::SPIRV {
 namespace {
 enum class Operation {
@@ -1020,7 +1023,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // RX_VK_FOLLOW_GRAPHICS=0: off)
     static const bool graphics{!getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0};
     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
-    const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh)) ||
+    // (tameem: a task or mesh stage whose pointer pass left an offset's address to the search follows them too, that stage only:
+    // global_memory_to_storage_buffer_pass.cpp g_follow_refused_stage. The emitting thread passed this stage just before)
+    const bool refused_mesh{(stage == Stage::Task || stage == Stage::Mesh) && Shader::Optimization::g_follow_refused_stage};
+    const bool follow_pointers{(stage == Stage::Compute || (!no_mesh && (stage == Stage::Task || stage == Stage::Mesh)) || refused_mesh ||
                                 (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
     Id ptr_u64{};
     if (follow_pointers) {

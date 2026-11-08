@@ -238,6 +238,9 @@ public:
     }
 
     Id operator<<(EndOp) {
+        // (upstream PR 225, e77efae: structures with identical members can have different layout decorations, so each is its own:
+        // a mesh stage that follows pointers declared one the same as another and the SPIR-V was invalid)
+        if (stream.words[stream.op_index] == static_cast<u32>(spv::Op::OpTypeStruct)) return stream << EndOp{};
         const auto begin = stream.words.data();
         std::vector<u32> declarations(begin + stream.op_index, begin + stream.insert_index);
 
